@@ -206,7 +206,7 @@ TICKER_MAP: dict[tuple[str, str], str | None] = {
     ("GMEXICO", "B"): "GMEXICOB.MX",
     ("KOF", "UBL"): "KOFUBL.MX",
     ("LASITE", "*"): "LASITE.MX",
-    ("LASITE", "B-1"): "LASITEB-1.MX",
+    ("LASITE", "B-1"): "LASITE.MX",  # yfinance no tiene serie B-1; usamos serie *
     ("MEGA", "CPO"): "MEGACPO.MX",
     ("NEMAK", "A"): "NEMAKA.MX",
     ("PE&OLES", "*"): "PE&OLES.MX",
@@ -1049,3 +1049,82 @@ with tab_data:
         f"Total: {n_total} instrumentos  |  con ticker yfinance: {n_yf}  |  "
         f"valuados al carry: {n_carry}"
     )
+
+    st.divider()
+    st.subheader("Historico de precios de cierre diarios (yfinance)")
+    st.caption(
+        "Cierre ajustado en MXN para cada ticker .MX en el rango seleccionado. "
+        "Una columna por ticker. Las celdas vacias son dias no-trading "
+        "(sabados, domingos, festivos)."
+    )
+
+    tickers_to_dl = sorted({t for t in cat["ticker_yfinance"].dropna().unique() if t})
+    if not tickers_to_dl:
+        st.info("No hay tickers para descargar.")
+    else:
+        prices_wide = fetch_prices(
+            tuple(tickers_to_dl),
+            pd.to_datetime(d_ini).strftime("%Y-%m-%d"),
+            (pd.to_datetime(d_fin) + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+        )
+
+        if prices_wide.empty:
+            st.warning("yfinance no devolvio precios.")
+        else:
+            # Format wide para visualizacion
+            prices_wide_view = prices_wide.copy()
+            prices_wide_view.index = prices_wide_view.index.strftime("%Y-%m-%d")
+            prices_wide_view.index.name = "fecha"
+
+            n_filas, n_cols = prices_wide.shape
+            st.caption(
+                f"{n_filas} dias x {n_cols} tickers descargados. "
+                f"Ausentes: {sorted(set(tickers_to_dl) - set(prices_wide.columns))}"
+            )
+
+            st.dataframe(
+                prices_wide_view.round(4),
+                use_container_width=True,
+            )
+
+            st.download_button(
+                "Descargar precios diarios - formato ancho (CSV)",
+                prices_wide.to_csv().encode("utf-8"),
+                "precios_diarios_wide.csv",
+                "text/csv",
+                key="dl_prices_wide",
+            )
+
+            # Formato largo con emisora/serie/tp para joins
+            long = prices_wide.stack(future_stack=True).rename("precio_cierre").reset_index()
+            long.columns = ["fecha", "ticker", "precio_cierre"]
+            cat_for_merge = cat[
+                ["tp", "emisora", "serie", "estrategia", "ticker_yfinance"]
+            ].rename(columns={"ticker_yfinance": "ticker"})
+            long = long.merge(cat_for_merge, on="ticker", how="left")
+            long = long[
+                ["fecha", "tp", "emisora", "serie", "estrategia", "ticker", "precio_cierre"]
+            ].sort_values(["emisora", "serie", "fecha"])
+
+            with st.expander("Ver formato largo (una fila por fecha-ticker)"):
+                st.dataframe(long, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Descargar precios diarios - formato largo (CSV)",
+                    long.to_csv(index=False).encode("utf-8"),
+                    "precios_diarios_long.csv",
+                    "text/csv",
+                    key="dl_prices_long",
+                )
+
+            # Mini-grafica multi-ticker normalizado base 100
+            with st.expander("Grafica de precios normalizados (base 100)"):
+                base = prices_wide.iloc[0]
+                norm = (prices_wide.divide(base) * 100).reset_index().melt(
+                    id_vars="Date", var_name="ticker", value_name="indice_100"
+                ).rename(columns={"Date": "fecha"})
+                fig_p = px.line(
+                    norm, x="fecha", y="indice_100", color="ticker",
+                    title="Precios normalizados (1er dia = 100)",
+                )
+                fig_p.update_layout(legend_title="", yaxis_tickformat=",.1f")
+                st.plotly_chart(fig_p, use_container_width=True)
