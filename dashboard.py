@@ -422,12 +422,14 @@ with tab_oper:
     st.plotly_chart(fig2, use_container_width=True)
 
     st.subheader("Tasas de reporto contratadas")
-    rep = mov_f[mov_f["concepto"] == "INICIO CPA REPORTO"].dropna(subset=["tasa_premio"])
+    rep = mov_f[mov_f["concepto"] == "INICIO CPA REPORTO"].dropna(subset=["tasa_premio"]).copy()
+    rep["monto_abs"] = rep["monto_neto"].abs()
+    rep = rep[rep["monto_abs"] > 0]
     if not rep.empty:
         fig3 = px.scatter(
             rep, x="fecha_op", y="tasa_premio", color="subcuenta",
-            size="monto_neto", hover_data=["emisora", "plazo"],
-            title="Tasa contratada vs fecha (tamano = monto)",
+            size="monto_abs", hover_data=["emisora", "plazo", "monto_neto"],
+            title="Tasa contratada vs fecha (tamano = |monto|)",
         )
         st.plotly_chart(fig3, use_container_width=True)
 
