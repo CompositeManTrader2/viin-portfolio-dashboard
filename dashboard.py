@@ -247,43 +247,117 @@ def get_ticker(emisora: str, serie: str | None) -> str | None:
     return None
 
 
+# Para los SC cross-listed (US ETFs/acciones en SIC), el .MX puede tener
+# baja liquidez y huecos. Mapeamos al ticker USD original; luego multiplicamos
+# por el USDMXN para tener un precio en MXN sin huecos.
+SC_USD_FALLBACK: dict[str, str] = {
+    "HYG.MX": "HYG",
+    "PFE.MX": "PFE",
+    "SHV.MX": "SHV",
+    "SHY.MX": "SHY",
+    "SPG.MX": "SPG",
+    "SPHY.MX": "SPHY",
+    "T.MX": "T",
+    "UNH.MX": "UNH",
+    "UPS.MX": "UPS",
+}
+FX_TICKER = "MXN=X"  # USDMXN spot en yfinance
+
+
+def _fetch_close(ticker: str, start: str, end: str) -> pd.Series | None:
+    """Descarga el cierre ajustado diario de un ticker; tolera errores."""
+    try:
+        data = yf.download(
+            ticker, start=start, end=end, progress=False,
+            auto_adjust=True, threads=False,
+        )
+        if data is None or data.empty:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            if ("Close", ticker) in data.columns:
+                s = data[("Close", ticker)]
+            elif "Close" in data.columns.get_level_values(0):
+                s = data["Close"].iloc[:, 0]
+            else:
+                return None
+        elif "Close" in data.columns:
+            s = data["Close"]
+        else:
+            return None
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            return None
+        s.index = pd.to_datetime(s.index)
+        if s.index.tz is not None:
+            s.index = s.index.tz_localize(None)
+        return s.sort_index()
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner="Descargando precios de yfinance...")
 def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Devuelve DataFrame con index=fecha, columnas=tickers, valores=precio cierre ajustado.
-    Tickers que fallan se omiten (no rompen)."""
+
+    Para tickers SC cross-listed (HYG.MX, SPHY.MX, etc.) que tienen baja liquidez
+    y huecos en yfinance, se complementa con USD x USDMXN: las fechas faltantes
+    en el .MX se rellenan con el ticker USD original convertido a pesos. Esto
+    asegura que ETFs ilquidos como SPHY.MX tengan precio TODOS los dias habiles.
+    """
     if not tickers:
         return pd.DataFrame()
-    out = {}
-    # Descargamos uno por uno para tolerar tickers invalidos.
+
+    # 1) Descarga directa de cada ticker .MX
+    out: dict[str, pd.Series] = {}
     for t in tickers:
-        try:
-            data = yf.download(
-                t, start=start, end=end, progress=False,
-                auto_adjust=True, threads=False,
-            )
-            if data is None or data.empty:
-                continue
-            # En versiones recientes yf.download puede devolver columnas multinivel
-            if isinstance(data.columns, pd.MultiIndex):
-                if ("Close", t) in data.columns:
-                    s = data[("Close", t)]
-                elif "Close" in data.columns.get_level_values(0):
-                    s = data["Close"].iloc[:, 0]
-                else:
+        s = _fetch_close(t, start, end)
+        if s is not None:
+            out[t] = s
+
+    # 2) Para los SC cross-listed: USD x USDMXN es la fuente PRIMARIA
+    # (NYSE liquidez real = sin outliers de baja liquidez en SIC). El .MX
+    # queda solo como respaldo para holidays US donde el USD no tradeo.
+    sc_requested = [t for t in tickers if t in SC_USD_FALLBACK]
+    if sc_requested:
+        usd_needed = sorted({SC_USD_FALLBACK[t] for t in sc_requested})
+        usd_data: dict[str, pd.Series] = {}
+        for ut in usd_needed + [FX_TICKER]:
+            s = _fetch_close(ut, start, end)
+            if s is not None:
+                usd_data[ut] = s
+
+        if FX_TICKER in usd_data:
+            fx = usd_data[FX_TICKER]
+            for mx_ticker in sc_requested:
+                usd_ticker = SC_USD_FALLBACK[mx_ticker]
+                if usd_ticker not in usd_data:
                     continue
-            elif "Close" in data.columns:
-                s = data["Close"]
-            else:
-                continue
-            s = pd.to_numeric(s, errors="coerce").dropna()
-            if not s.empty:
-                out[t] = s
-        except Exception:
-            continue
+                # Sintetico: USD * USDMXN
+                aligned = pd.concat(
+                    [usd_data[usd_ticker].rename("usd"), fx.rename("fx")], axis=1
+                )
+                aligned["mxn"] = aligned["usd"] * aligned["fx"]
+                synthetic = aligned["mxn"].dropna()
+                if synthetic.empty:
+                    # Si no hay USD/FX, dejamos el .MX si existe
+                    continue
+
+                if mx_ticker in out:
+                    secondary = out[mx_ticker]
+                    full_idx = synthetic.index.union(secondary.index)
+                    primary_full = synthetic.reindex(full_idx)
+                    secondary_full = secondary.reindex(full_idx)
+                    # PRIMARIO = sintetico USD*FX; respaldo = .MX
+                    out[mx_ticker] = primary_full.fillna(secondary_full)
+                else:
+                    out[mx_ticker] = synthetic
+
     if not out:
         return pd.DataFrame()
     df = pd.DataFrame(out)
-    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
     df = df.sort_index()
     return df
 
@@ -1054,8 +1128,11 @@ with tab_data:
     st.subheader("Historico de precios de cierre diarios (yfinance)")
     st.caption(
         "Cierre ajustado en MXN para cada ticker .MX en el rango seleccionado. "
-        "Una columna por ticker. Las celdas vacias son dias no-trading "
-        "(sabados, domingos, festivos)."
+        "Una columna por ticker. Para los SC cross-listed (HYG, SPHY, SHV, "
+        "etc.) la fuente PRIMARIA es el ticker USD original x USDMXN (NYSE = "
+        "liquidez real, sin outliers de SIC). En holidays donde NYSE estuvo "
+        "cerrado se aplica forward-fill desde el ultimo cierre conocido para "
+        "garantizar precio en todos los dias habiles MX."
     )
 
     tickers_to_dl = sorted({t for t in cat["ticker_yfinance"].dropna().unique() if t})
@@ -1071,16 +1148,30 @@ with tab_data:
         if prices_wide.empty:
             st.warning("yfinance no devolvio precios.")
         else:
+            # Reindex a dias habiles MX en el rango y aplicar ffill
+            bdays_idx = pd.bdate_range(
+                start=pd.to_datetime(d_ini), end=pd.to_datetime(d_fin)
+            )
+            prices_wide_filled = prices_wide.reindex(
+                prices_wide.index.union(bdays_idx)
+            ).sort_index().ffill().reindex(bdays_idx)
+
             # Format wide para visualizacion
-            prices_wide_view = prices_wide.copy()
+            prices_wide_view = prices_wide_filled.copy()
             prices_wide_view.index = prices_wide_view.index.strftime("%Y-%m-%d")
             prices_wide_view.index.name = "fecha"
 
-            n_filas, n_cols = prices_wide.shape
+            n_filas, n_cols = prices_wide_filled.shape
+            ausentes = sorted(set(tickers_to_dl) - set(prices_wide.columns))
+            n_ffill = int(prices_wide_filled.notna().sum().sum() - prices_wide.reindex(bdays_idx).notna().sum().sum())
             st.caption(
-                f"{n_filas} dias x {n_cols} tickers descargados. "
-                f"Ausentes: {sorted(set(tickers_to_dl) - set(prices_wide.columns))}"
+                f"{n_filas} dias habiles x {n_cols} tickers. "
+                f"Ausentes: {ausentes if ausentes else 'ninguno'}. "
+                f"Celdas rellenadas con forward-fill (holidays NYSE/BMV): {n_ffill:,}."
             )
+
+            # Para descarga / formato largo usamos el filled
+            prices_wide = prices_wide_filled
 
             st.dataframe(
                 prices_wide_view.round(4),
