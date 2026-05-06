@@ -1209,10 +1209,12 @@ with tab_data:
 
             # Mini-grafica multi-ticker normalizado base 100
             with st.expander("Grafica de precios normalizados (base 100)"):
-                base = prices_wide.iloc[0]
-                norm = (prices_wide.divide(base) * 100).reset_index().melt(
-                    id_vars="Date", var_name="ticker", value_name="indice_100"
-                ).rename(columns={"Date": "fecha"})
+                pw = prices_wide.copy()
+                pw.index.name = "fecha"
+                base = pw.iloc[0]
+                norm = (pw.divide(base) * 100).reset_index().melt(
+                    id_vars="fecha", var_name="ticker", value_name="indice_100"
+                )
                 fig_p = px.line(
                     norm, x="fecha", y="indice_100", color="ticker",
                     title="Precios normalizados (1er dia = 100)",
