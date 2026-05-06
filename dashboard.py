@@ -940,19 +940,112 @@ with tab_oper:
 
 # ---- DATOS CRUDOS -----------------------------------------------------------
 with tab_data:
-    st.subheader("Movimientos")
+    st.subheader("Movimientos consolidados")
     st.dataframe(mov_f, use_container_width=True, hide_index=True)
-    st.subheader("Posiciones")
-    st.dataframe(pos_f, use_container_width=True, hide_index=True)
     st.download_button(
         "Descargar movimientos consolidados (CSV)",
         mov_f.to_csv(index=False).encode("utf-8"),
         "movimientos_consolidados.csv",
         "text/csv",
     )
+
+    st.divider()
+    st.subheader("Posiciones por fecha de cierre de mes")
+    st.caption(
+        "Una tabla por cada archivo LayOut*.xlsm. Filtradas por los portafolios "
+        "seleccionados en el sidebar."
+    )
+
+    pos_cols_show = [
+        "subcuenta", "tp", "emisora", "serie", "cupon", "plazo", "tasa",
+        "dias_x_ven", "titulos", "precio", "importe_bruto", "precio_neto",
+        "importe_neto", "precio_mercado", "valor_mercado_neto",
+        "plus_minus_int", "plus_minus_pct", "pct_cartera", "estrategia",
+    ]
+
+    snap_dates_all = sorted(pos_f["fecha"].dropna().unique())
+    for d in snap_dates_all:
+        d_ts = pd.Timestamp(d)
+        sub = (
+            pos_f[pos_f["fecha"] == d_ts]
+            .sort_values(["subcuenta", "tp", "emisora", "serie"])[pos_cols_show]
+        )
+        # Total del snapshot (sumas validas para columnas numericas)
+        total_val = sub["valor_mercado_neto"].sum()
+        with st.expander(
+            f"Posicion al {d_ts:%Y-%m-%d}  -  {len(sub)} lineas  -  "
+            f"Valor total: ${total_val:,.0f}",
+            expanded=(d_ts == max(snap_dates_all)),
+        ):
+            st.dataframe(sub, use_container_width=True, hide_index=True)
+            st.download_button(
+                f"Descargar posicion {d_ts:%Y-%m-%d} (CSV)",
+                sub.to_csv(index=False).encode("utf-8"),
+                f"posicion_{d_ts:%Y%m%d}.csv",
+                "text/csv",
+                key=f"dl_pos_{d_ts:%Y%m%d}",
+            )
+
     st.download_button(
-        "Descargar posiciones consolidadas (CSV)",
+        "Descargar todas las posiciones consolidadas (CSV)",
         pos_f.to_csv(index=False).encode("utf-8"),
         "posiciones_consolidadas.csv",
         "text/csv",
+    )
+
+    st.divider()
+    st.subheader("Catalogo de emisoras y tickers de yfinance")
+    st.caption(
+        "Lista deduplicada de todas las (emisora, serie) que aparecieron en "
+        "cualquier snapshot de Posicion. Ticker = simbolo en yfinance usado "
+        "para mark-to-market en MXN. Origen='yfinance' significa que se valua "
+        "con precio de mercado diario; 'carry' significa que se valua al valor "
+        "en libros interpolado entre snapshots (renta fija, reporto y emisoras "
+        "sin precio en yfinance)."
+    )
+
+    # Construir el catalogo desde los snapshots reales (todos los portafolios)
+    cat = (
+        pos[["tp", "emisora", "serie", "estrategia"]]
+        .drop_duplicates()
+        .sort_values(["tp", "emisora", "serie"])
+        .reset_index(drop=True)
+    )
+    cat["ticker_yfinance"] = cat.apply(
+        lambda r: get_ticker(r["emisora"], r["serie"]), axis=1
+    )
+    cat["origen"] = np.where(cat["ticker_yfinance"].notna(), "yfinance", "carry")
+
+    # Aviso de tickers que se intentaron descargar pero no devolvieron data
+    if "missing" in dir():
+        pass  # noqa
+    # Recalculamos missing leyendo del calculo MTM mas reciente, si esta en cache
+    try:
+        _, _, missing_now = compute_daily_mtm(
+            pos_f, mov_f,
+            pd.to_datetime(d_ini).strftime("%Y-%m-%d"),
+            pd.to_datetime(d_fin).strftime("%Y-%m-%d"),
+        )
+        cat["yfinance_devolvio_data"] = np.where(
+            cat["ticker_yfinance"].isna(), "(n/a)",
+            np.where(cat["ticker_yfinance"].isin(missing_now), "NO", "SI"),
+        )
+    except Exception:
+        cat["yfinance_devolvio_data"] = "(no calculado)"
+
+    st.dataframe(cat, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Descargar catalogo de emisoras (CSV)",
+        cat.to_csv(index=False).encode("utf-8"),
+        "catalogo_emisoras_tickers.csv",
+        "text/csv",
+    )
+
+    # Resumen rapido
+    n_total = len(cat)
+    n_yf = (cat["origen"] == "yfinance").sum()
+    n_carry = (cat["origen"] == "carry").sum()
+    st.caption(
+        f"Total: {n_total} instrumentos  |  con ticker yfinance: {n_yf}  |  "
+        f"valuados al carry: {n_carry}"
     )
