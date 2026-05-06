@@ -65,6 +65,21 @@ def _file_date(path: Path) -> datetime | None:
     return datetime(int(y), int(mo), int(d))
 
 
+def _fit_columns(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Ajusta el DataFrame para tener exactamente las columnas esperadas.
+    Si faltan columnas las rellena con NaN; si sobran, las descarta."""
+    n_have = df.shape[1]
+    n_want = len(cols)
+    if n_have < n_want:
+        for i in range(n_have, n_want):
+            df[i] = np.nan
+    elif n_have > n_want:
+        df = df.iloc[:, :n_want]
+    df = df.copy()
+    df.columns = cols
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Loaders
 # ---------------------------------------------------------------------------
@@ -84,9 +99,8 @@ def load_movimientos(files: list[str]) -> pd.DataFrame:
         if not sn:
             continue
         raw = pd.read_excel(xl, sheet_name=sn, header=None, engine="openpyxl")
-        # data starts on row index 8 (row 9 in excel); 18 columns
-        body = raw.iloc[8:, :18].copy()
-        body.columns = cols
+        # data starts on row index 8 (row 9 in excel)
+        body = _fit_columns(raw.iloc[8:].copy(), cols)
         body = body.dropna(subset=["subcuenta"])
         body["subcuenta"] = body["subcuenta"].astype(str).str.strip()
         body = body[body["subcuenta"].isin(PORTFOLIOS)].copy()
@@ -127,8 +141,7 @@ def load_posiciones(files: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
         if not sn:
             continue
         raw = pd.read_excel(xl, sheet_name=sn, header=None, engine="openpyxl")
-        body = raw.iloc[8:, :19].copy()
-        body.columns = cols
+        body = _fit_columns(raw.iloc[8:].copy(), cols)
         body["emisora"] = body["emisora"].astype(str).str.strip()
         body["subcuenta"] = body["subcuenta"].astype(str).str.strip()
 
