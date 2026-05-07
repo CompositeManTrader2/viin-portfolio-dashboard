@@ -2146,11 +2146,12 @@ with tab_oper:
         "dividendos dan el detalle del movimiento real del portafolio."
     )
     mix = (
-        mov_f.groupby(["subcuenta", "concepto"], as_index=False)["monto_neto"]
-        .agg(["sum", "count"])
-        .reset_index()
+        mov_f.groupby(["subcuenta", "concepto"], as_index=False)
+        .agg(
+            monto_neto=("monto_neto", "sum"),
+            n_ops=("monto_neto", "count"),
+        )
     )
-    mix.columns = ["subcuenta", "concepto", "monto_neto", "n_ops"]
     mix["monto_abs"] = mix["monto_neto"].abs()
     # Top 10 conceptos en valor
     top_conc = (
