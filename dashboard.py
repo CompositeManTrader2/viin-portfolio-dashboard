@@ -637,7 +637,55 @@ def compute_daily_mtm(
     pivoted = pivoted.rename(columns={"yfinance": "valor_equity", "carry": "valor_carry"})
 
     by_port = pivoted.merge(cash, on=["fecha", "subcuenta"], how="left").fillna({"efectivo": 0.0})
-    by_port["valor_total"] = by_port["valor_equity"] + by_port["valor_carry"] + by_port["efectivo"]
+    by_port["valor_total_raw"] = (
+        by_port["valor_equity"] + by_port["valor_carry"] + by_port["efectivo"]
+    )
+
+    # ----------------------------------------------------------------------
+    # Calibracion contra snapshots oficiales de Posicion.
+    # En cada fecha de snapshot, el valor oficial = sum(valor_mercado_neto)
+    # incluye todo (equities + renta fija + reporto + cash + intereses
+    # devengados). Calculamos el residual = oficial - raw en esos dias y lo
+    # interpolamos linealmente entre snapshots para distribuirlo dia a dia.
+    # Esto garantiza:
+    #   - En cada cierre de mes: valor_total == valor oficial del archivo.
+    #   - Entre snapshots: los movimientos diarios reflejan precios yfinance
+    #     mas un ajuste suave que cubre devengo de bonos, diferencia de
+    #     precios yfinance vs BMV, y otras pequenas brechas metodologicas.
+    # ----------------------------------------------------------------------
+    official = (
+        pos.groupby(["fecha", "subcuenta"], as_index=False)["valor_mercado_neto"]
+        .sum()
+        .rename(columns={"valor_mercado_neto": "valor_oficial"})
+    )
+    by_port = by_port.merge(official, on=["fecha", "subcuenta"], how="left")
+    # residual_anchor: solo en dias de snapshot (NaN en el resto)
+    by_port["residual_anchor"] = by_port["valor_oficial"] - by_port["valor_total_raw"]
+
+    # Interpolacion temporal del residual por subcuenta (vectorizado).
+    by_port = by_port.sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
+    pieces = []
+    for port, g in by_port.groupby("subcuenta", sort=False):
+        g = g.sort_values("fecha").set_index("fecha")
+        g["ajuste_calibracion"] = (
+            g["residual_anchor"]
+            .interpolate(method="time", limit_direction="both")
+            .fillna(0.0)
+        )
+        g = g.reset_index()
+        pieces.append(g)
+    by_port = pd.concat(pieces, ignore_index=True)
+    by_port["valor_total"] = by_port["valor_total_raw"] + by_port["ajuste_calibracion"]
+
+    # Orden de columnas
+    cols_order = [
+        "fecha", "subcuenta",
+        "valor_equity", "valor_carry", "efectivo",
+        "valor_total_raw", "ajuste_calibracion", "valor_total",
+        "valor_oficial",
+    ]
+    by_port = by_port[cols_order].sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
+
     return by_port, h, missing
 
 
@@ -728,11 +776,13 @@ tab_mtm, tab_actividad, tab_mensual, tab_compos, tab_oper, tab_data = st.tabs(
 
 # ---- MTM DIARIO -------------------------------------------------------------
 with tab_mtm:
-    st.subheader("Valor diario del portafolio (mark-to-market via yfinance)")
+    st.subheader("Valor diario del portafolio (calibrado a snapshots)")
     st.caption(
-        "Valuacion = titulos x precio diario yfinance (.MX, MXN) para equities/ETFs "
-        "+ valor en libros interpolado para renta fija/reporto + saldo de efectivo. "
-        "Tickers sin data en yfinance caen automaticamente al valor en libros."
+        "Metodologia: Valor diario = (titulos x precio yfinance) + (importe_neto "
+        "interpolado para renta fija/reporto) + saldo de efectivo + ajuste de "
+        "calibracion. El ajuste se computa de forma que en cada cierre de mes "
+        "el valor coincida EXACTAMENTE con el `valor_mercado_neto` oficial del "
+        "archivo Posicion, y se interpola linealmente entre snapshots."
     )
 
     s_date = pd.to_datetime(d_ini).strftime("%Y-%m-%d")
@@ -742,22 +792,127 @@ with tab_mtm:
     if daily_mtm.empty:
         st.warning("No hay datos suficientes para calcular MTM en el rango seleccionado.")
     else:
-        # Grafica principal: valor total por dia
+        # ---- Grafica principal: valor total por dia ----
         fig_total = px.line(
             daily_mtm, x="fecha", y="valor_total", color="subcuenta",
-            title="Valor total diario por portafolio (MXN)",
+            title="Valor total diario por portafolio (MXN, calibrado)",
         )
+        # Marcar fechas de snapshot con puntos
+        snap_dates_in_range = sorted(
+            d for d in pos_f["fecha"].dropna().unique()
+            if pd.Timestamp(d) >= pd.Timestamp(s_date)
+            and pd.Timestamp(d) <= pd.Timestamp(e_date)
+        )
+        for port in daily_mtm["subcuenta"].unique():
+            sub = daily_mtm[
+                (daily_mtm["subcuenta"] == port)
+                & (daily_mtm["fecha"].isin(snap_dates_in_range))
+            ]
+            fig_total.add_trace(go.Scatter(
+                x=sub["fecha"], y=sub["valor_total"],
+                mode="markers", marker=dict(size=8, symbol="diamond"),
+                name=f"{port} (snapshot)", showlegend=False,
+            ))
         fig_total.update_layout(yaxis_tickformat=",.0f", legend_title="")
         st.plotly_chart(fig_total, use_container_width=True)
 
-        # Descomposicion stacked por componente para el portafolio seleccionado
-        st.subheader("Descomposicion diaria por componente")
+        # ---- Auditoria de calibracion ----
+        st.subheader("Auditoria de calibracion (vs Posicion oficial)")
+        snap_check = (
+            daily_mtm.dropna(subset=["valor_oficial"])
+            [["fecha", "subcuenta", "valor_total_raw",
+              "ajuste_calibracion", "valor_total", "valor_oficial"]]
+            .sort_values(["subcuenta", "fecha"])
+            .reset_index(drop=True)
+        )
+        snap_check["error_abs"] = snap_check["valor_total"] - snap_check["valor_oficial"]
+        snap_check["error_pct"] = (
+            snap_check["error_abs"] / snap_check["valor_oficial"] * 100
+        )
+        st.dataframe(
+            snap_check.style.format({
+                "valor_total_raw": "${:,.2f}",
+                "ajuste_calibracion": "${:,.2f}",
+                "valor_total": "${:,.2f}",
+                "valor_oficial": "${:,.2f}",
+                "error_abs": "${:,.4f}",
+                "error_pct": "{:,.6f}%",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+        max_err = snap_check["error_pct"].abs().max()
+        if max_err < 1e-4:
+            st.success(
+                f"Calibracion exacta: maximo error en snapshots = "
+                f"{max_err:.2e}%. Cada fin de mes hace match con la Posicion oficial."
+            )
+        else:
+            st.warning(f"Maximo error de calibracion: {max_err:.4f}%")
+
+        # ---- Tabla diaria completa ----
+        st.subheader("Tabla diaria por portafolio")
         port_pick = st.selectbox(
-            "Portafolio para descomposicion",
+            "Portafolio",
             sorted(daily_mtm["subcuenta"].unique()),
             key="mtm_port_pick",
         )
-        sub = daily_mtm[daily_mtm["subcuenta"] == port_pick].sort_values("fecha")
+        sub = (
+            daily_mtm[daily_mtm["subcuenta"] == port_pick]
+            .sort_values("fecha")
+            .copy()
+        )
+
+        # Saldo de efectivo y valor total como series side-by-side
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            "Valor portafolio (ultimo dia)",
+            f"${sub['valor_total'].iloc[-1]:,.0f}",
+            delta=f"{(sub['valor_total'].iloc[-1]/sub['valor_total'].iloc[0]-1)*100:.2f}% periodo",
+        )
+        c2.metric(
+            "Efectivo (ultimo dia)",
+            f"${sub['efectivo'].iloc[-1]:,.0f}",
+        )
+        c3.metric(
+            "Equities + Renta fija (ultimo dia)",
+            f"${(sub['valor_equity'].iloc[-1] + sub['valor_carry'].iloc[-1]):,.0f}",
+        )
+
+        # Tabla diaria completa
+        tabla_diaria = sub[[
+            "fecha", "valor_equity", "valor_carry", "efectivo",
+            "valor_total_raw", "ajuste_calibracion", "valor_total", "valor_oficial",
+        ]].copy()
+        tabla_diaria["fecha"] = tabla_diaria["fecha"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            tabla_diaria.style.format({
+                "valor_equity": "${:,.2f}",
+                "valor_carry": "${:,.2f}",
+                "efectivo": "${:,.2f}",
+                "valor_total_raw": "${:,.2f}",
+                "ajuste_calibracion": "${:,.2f}",
+                "valor_total": "${:,.2f}",
+                "valor_oficial": "${:,.2f}",
+            }, na_rep="-"),
+            use_container_width=True, hide_index=True, height=400,
+        )
+        st.download_button(
+            f"Descargar tabla diaria {port_pick} (CSV)",
+            sub.to_csv(index=False).encode("utf-8"),
+            f"mtm_diario_{port_pick}.csv",
+            "text/csv",
+            key=f"dl_mtm_{port_pick}",
+        )
+        st.download_button(
+            "Descargar tabla diaria - todos los portafolios (CSV)",
+            daily_mtm.to_csv(index=False).encode("utf-8"),
+            "mtm_diario_todos.csv",
+            "text/csv",
+            key="dl_mtm_all",
+        )
+
+        # ---- Descomposicion stacked por componente ----
+        st.subheader(f"Descomposicion diaria - {port_pick}")
         fig_dec = go.Figure()
         fig_dec.add_trace(go.Scatter(
             x=sub["fecha"], y=sub["valor_equity"],
@@ -765,19 +920,24 @@ with tab_mtm:
         ))
         fig_dec.add_trace(go.Scatter(
             x=sub["fecha"], y=sub["valor_carry"],
-            stackgroup="one", name="Renta fija / Reporto (libros)",
+            stackgroup="one", name="Renta fija / Reporto (carry)",
         ))
         fig_dec.add_trace(go.Scatter(
             x=sub["fecha"], y=sub["efectivo"],
             stackgroup="one", name="Efectivo",
         ))
+        fig_dec.add_trace(go.Scatter(
+            x=sub["fecha"], y=sub["ajuste_calibracion"],
+            stackgroup="one", name="Ajuste de calibracion",
+        ))
         fig_dec.update_layout(
             yaxis_tickformat=",.0f",
-            title=f"{port_pick} - Stack diario",
+            title=f"{port_pick} - Composicion diaria del valor",
+            legend_title="",
         )
         st.plotly_chart(fig_dec, use_container_width=True)
 
-        # Rendimiento diario
+        # ---- Rendimiento diario ----
         st.subheader("Rendimiento diario (% sobre valor del dia anterior)")
         ret = daily_mtm.sort_values(["subcuenta", "fecha"]).copy()
         ret["valor_lag"] = ret.groupby("subcuenta")["valor_total"].shift(1)
@@ -790,7 +950,7 @@ with tab_mtm:
         fig_ret.update_layout(yaxis_tickformat=".2%")
         st.plotly_chart(fig_ret, use_container_width=True)
 
-        # Curva de retorno acumulado normalizada (base = primer dia)
+        # ---- Indice base 100 ----
         st.subheader("Indice base 100 (rendimiento acumulado)")
         idx = daily_mtm.sort_values(["subcuenta", "fecha"]).copy()
         first_vals = idx.groupby("subcuenta")["valor_total"].transform("first")
@@ -802,16 +962,19 @@ with tab_mtm:
         fig_idx.update_layout(yaxis_tickformat=",.1f")
         st.plotly_chart(fig_idx, use_container_width=True)
 
-        # Tabla resumen
+        # ---- Resumen del periodo ----
         st.subheader("Resumen del periodo")
         res = []
         for port, g in daily_mtm.groupby("subcuenta"):
             g = g.sort_values("fecha")
             v0, vN = g["valor_total"].iloc[0], g["valor_total"].iloc[-1]
             ret_total = vN / v0 - 1 if v0 else np.nan
-            daily = (g["valor_total"] / g["valor_total"].shift(1) - 1).dropna()
-            vol = daily.std() * np.sqrt(252) if len(daily) > 1 else np.nan
-            sharpe = (daily.mean() * 252) / (daily.std() * np.sqrt(252)) if daily.std() else np.nan
+            ddaily = (g["valor_total"] / g["valor_total"].shift(1) - 1).dropna()
+            vol = ddaily.std() * np.sqrt(252) if len(ddaily) > 1 else np.nan
+            sharpe = (
+                (ddaily.mean() * 252) / (ddaily.std() * np.sqrt(252))
+                if ddaily.std() else np.nan
+            )
             mdd = ((g["valor_total"] / g["valor_total"].cummax()) - 1).min()
             res.append({
                 "Portafolio": port,
@@ -829,13 +992,13 @@ with tab_mtm:
 
         if missing:
             st.warning(
-                f"Tickers sin data en yfinance (se valuaron al valor en libros): "
+                f"Tickers sin data en yfinance (cayeron a carry): "
                 f"{', '.join(missing)}"
             )
 
         with st.expander("Holdings + precios (debug)"):
             st.dataframe(
-                holdings_full.sort_values(["subcuenta", "fecha", "emisora"]).head(2000),
+                holdings_full.sort_values(["subcuenta", "fecha", "emisora"]).head(3000),
                 use_container_width=True, hide_index=True,
             )
 
