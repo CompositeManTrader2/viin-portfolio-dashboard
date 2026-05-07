@@ -264,6 +264,58 @@ SC_USD_FALLBACK: dict[str, str] = {
 FX_TICKER = "MXN=X"  # USDMXN spot en yfinance
 
 
+def _fetch_close_batch(
+    tickers: list[str], start: str, end: str
+) -> dict[str, pd.Series]:
+    """Descarga batch de varios tickers en una sola request HTTP.
+
+    Mucho mas eficiente y robusto que descargar uno por uno: yfinance hace
+    una sola peticion al endpoint de quotes, lo que reduce drasticamente el
+    rate-limiting que Yahoo aplica cuando varias IPs comparten subnets
+    (caso tipico de Streamlit Cloud).
+    """
+    if not tickers:
+        return {}
+    try:
+        data = yf.download(
+            tickers, start=start, end=end, progress=False,
+            auto_adjust=False, threads=True, group_by="ticker",
+        )
+    except Exception:
+        return {}
+    if data is None or data.empty:
+        return {}
+
+    out: dict[str, pd.Series] = {}
+
+    if len(tickers) == 1:
+        # Single ticker: data.columns es plana (no MultiIndex)
+        t = tickers[0]
+        if "Close" in data.columns:
+            s = pd.to_numeric(data["Close"], errors="coerce").dropna()
+            if not s.empty:
+                s.index = pd.to_datetime(s.index)
+                if s.index.tz is not None:
+                    s.index = s.index.tz_localize(None)
+                out[t] = s.sort_index()
+        return out
+
+    if isinstance(data.columns, pd.MultiIndex):
+        # group_by='ticker' devuelve (ticker, campo)
+        for t in tickers:
+            try:
+                if (t, "Close") in data.columns:
+                    s = pd.to_numeric(data[(t, "Close")], errors="coerce").dropna()
+                    if not s.empty:
+                        s.index = pd.to_datetime(s.index)
+                        if s.index.tz is not None:
+                            s.index = s.index.tz_localize(None)
+                        out[t] = s.sort_index()
+            except Exception:
+                continue
+    return out
+
+
 def _fetch_close(ticker: str, start: str, end: str) -> pd.Series | None:
     """Descarga el cierre diario sin ajustar de un ticker; tolera errores.
 
@@ -315,12 +367,21 @@ def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame
     if not tickers:
         return pd.DataFrame()
 
-    # 1) Descarga directa de cada ticker .MX
-    out: dict[str, pd.Series] = {}
-    for t in tickers:
-        s = _fetch_close(t, start, end)
-        if s is not None:
-            out[t] = s
+    # 1) Descarga batch de todos los tickers .MX en UNA sola request
+    out: dict[str, pd.Series] = _fetch_close_batch(list(tickers), start, end)
+
+    # 1b) Reintentar individualmente los que fallaron (rate-limiting de Yahoo
+    # es comun en Streamlit Cloud por compartir IPs). Hasta 3 intentos con
+    # backoff incremental.
+    import time
+    failed = [t for t in tickers if t not in out or out[t].empty]
+    for t in failed:
+        for attempt in range(3):
+            time.sleep(0.5 * (attempt + 1))
+            s = _fetch_close(t, start, end)
+            if s is not None and not s.empty:
+                out[t] = s
+                break
 
     # 2) Para los SC cross-listed: USD x USDMXN es la fuente PRIMARIA
     # (NYSE liquidez real = sin outliers de baja liquidez en SIC). El .MX
@@ -328,11 +389,17 @@ def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame
     sc_requested = [t for t in tickers if t in SC_USD_FALLBACK]
     if sc_requested:
         usd_needed = sorted({SC_USD_FALLBACK[t] for t in sc_requested})
-        usd_data: dict[str, pd.Series] = {}
-        for ut in usd_needed + [FX_TICKER]:
-            s = _fetch_close(ut, start, end)
-            if s is not None:
-                usd_data[ut] = s
+        usd_universe = usd_needed + [FX_TICKER]
+        # Batch + reintentos individuales
+        usd_data: dict[str, pd.Series] = _fetch_close_batch(usd_universe, start, end)
+        usd_failed = [t for t in usd_universe if t not in usd_data or usd_data[t].empty]
+        for t in usd_failed:
+            for attempt in range(3):
+                time.sleep(0.5 * (attempt + 1))
+                s = _fetch_close(t, start, end)
+                if s is not None and not s.empty:
+                    usd_data[t] = s
+                    break
 
         if FX_TICKER in usd_data:
             fx = usd_data[FX_TICKER]
