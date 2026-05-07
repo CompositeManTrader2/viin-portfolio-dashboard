@@ -689,6 +689,160 @@ def compute_daily_mtm(
     return by_port, h, missing
 
 
+def reconstruct_position(
+    portfolio: str,
+    target_date: pd.Timestamp,
+    pos: pd.DataFrame,
+    holdings_full: pd.DataFrame,
+    daily_mtm: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict]:
+    """Reconstruye la hoja Posicion para `portfolio` a la fecha `target_date`.
+
+    Para cada (emisora, serie) que el portafolio tiene con titulos > 0 ese dia,
+    arma una fila con la misma estructura que Posicion del archivo. Los campos
+    estaticos (cupon, plazo, tasa, estrategia) se toman del snapshot mas reciente
+    <= target_date. dias_x_ven se descuenta por dias transcurridos. Los precios
+    de mercado vienen de yfinance (o del importe_neto interpolado para renta
+    fija). El valor_mercado_neto y plus_minus reflejan los datos del dia.
+
+    Devuelve (df_posicion, totals_dict).
+    """
+    target_ts = pd.Timestamp(target_date)
+
+    # Holdings del dia
+    h = holdings_full[
+        (holdings_full["subcuenta"] == portfolio)
+        & (holdings_full["fecha"] == target_ts)
+    ].copy()
+
+    # Snapshots del portafolio
+    snaps = pos[pos["subcuenta"] == portfolio].copy()
+    snaps["serie_n"] = snaps["serie"].astype(str).str.strip()
+    h["serie_n"] = h["serie"].astype(str).str.strip()
+
+    # Solo posiciones con titulos vivos
+    h_alive = h[h["titulos"] > 0].copy()
+
+    rows = []
+    for _, hr in h_alive.iterrows():
+        emi, serie_n = hr["emisora"], hr["serie_n"]
+        # Snapshot mas reciente <= target_ts
+        match = snaps[
+            (snaps["emisora"] == emi)
+            & (snaps["serie_n"] == serie_n)
+            & (snaps["fecha"] <= target_ts)
+        ].sort_values("fecha").tail(1)
+
+        if not match.empty:
+            sr = match.iloc[0]
+            ago_days = max(0, (target_ts - pd.Timestamp(sr["fecha"])).days)
+            cupon = sr.get("cupon")
+            plazo = sr.get("plazo")
+            tasa = sr.get("tasa")
+            dias_orig = sr.get("dias_x_ven")
+            dias_x_ven = (
+                max(0, dias_orig - ago_days)
+                if pd.notna(dias_orig) else None
+            )
+            precio_costo = sr.get("precio")
+            importe_bruto = sr.get("importe_bruto")
+            precio_neto = sr.get("precio_neto")
+            estrategia = sr.get("estrategia")
+            serie_display = sr.get("serie", hr["serie"])
+        else:
+            cupon = plazo = tasa = dias_x_ven = None
+            precio_costo = importe_bruto = precio_neto = None
+            estrategia = None
+            serie_display = hr["serie"]
+
+        # Valor de mercado y precio de mercado
+        if hr.get("fuente") == "yfinance" and pd.notna(hr.get("precio")):
+            precio_mercado = float(hr["precio"])
+            valor_mercado_neto = float(hr["titulos"]) * precio_mercado
+        else:
+            # carry: usamos importe_neto interpolado del dia
+            valor_mercado_neto = float(hr.get("valor", 0.0))
+            precio_mercado = (
+                valor_mercado_neto / float(hr["titulos"])
+                if hr["titulos"] else None
+            )
+
+        # importe_neto del dia (interpolado): viene en holdings_full
+        importe_neto_dia = (
+            float(hr["importe_neto"]) if pd.notna(hr.get("importe_neto"))
+            else None
+        )
+
+        plus_minus_int = (
+            valor_mercado_neto - importe_neto_dia
+            if importe_neto_dia is not None else None
+        )
+        plus_minus_pct = (
+            plus_minus_int / importe_neto_dia
+            if (plus_minus_int is not None and importe_neto_dia)
+            else None
+        )
+
+        rows.append({
+            "Posicion": hr["tp"],
+            "Subcuentas": portfolio,
+            "Emisora": emi,
+            "Serie": serie_display,
+            "Cupon": cupon,
+            "Plazo": plazo,
+            "Tasa": tasa,
+            "Dias x Ven": dias_x_ven,
+            "Titulos": float(hr["titulos"]),
+            "Precio": precio_costo,
+            "Importe Bruto": importe_bruto,
+            "Precio Neto": precio_neto,
+            "Importe Neto": importe_neto_dia,
+            "Precio de Mercado": precio_mercado,
+            "Valor de Mercado Neto": valor_mercado_neto,
+            "Plus/Minus + Int. Dev.": plus_minus_int,
+            "Plus/Minus %": plus_minus_pct,
+            "% de Cartera": None,  # se llena despues
+            "Estrategia": estrategia,
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Totales del dia desde daily_mtm
+    drow = daily_mtm[
+        (daily_mtm["subcuenta"] == portfolio)
+        & (daily_mtm["fecha"] == target_ts)
+    ]
+    if not drow.empty:
+        d = drow.iloc[0]
+        valor_portafolio = float(d["valor_total"])
+        efectivo = float(d["efectivo"])
+        valor_equity = float(d["valor_equity"])
+        valor_carry = float(d["valor_carry"])
+        ajuste = float(d["ajuste_calibracion"])
+    else:
+        valor_portafolio = df["Valor de Mercado Neto"].sum() if not df.empty else 0
+        efectivo = 0.0
+        valor_equity = valor_carry = ajuste = 0.0
+
+    # % de Cartera (basado en valor_portafolio TOTAL, incluido cash)
+    if not df.empty and valor_portafolio:
+        df["% de Cartera"] = df["Valor de Mercado Neto"] / valor_portafolio
+
+    # Orden por TP, emisora, serie (como aparece en Posicion)
+    if not df.empty:
+        df = df.sort_values(["Posicion", "Emisora", "Serie"]).reset_index(drop=True)
+
+    totals = {
+        "valor_portafolio": valor_portafolio,
+        "efectivo": efectivo,
+        "valor_equity": valor_equity,
+        "valor_carry": valor_carry,
+        "ajuste_calibracion": ajuste,
+        "es_snapshot": target_ts in pd.DatetimeIndex(pos["fecha"].dropna().unique()),
+    }
+    return df, totals
+
+
 # ---------------------------------------------------------------------------
 # Sidebar / file discovery
 # ---------------------------------------------------------------------------
@@ -770,9 +924,13 @@ st.divider()
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_mtm, tab_actividad, tab_mensual, tab_compos, tab_oper, tab_data = st.tabs(
-    ["MTM Diario", "Actividad diaria", "Mensual", "Composicion", "Operaciones", "Datos crudos"]
-)
+(
+    tab_mtm, tab_carta, tab_actividad, tab_mensual,
+    tab_compos, tab_oper, tab_data,
+) = st.tabs([
+    "MTM Diario", "Carta de Posicion", "Actividad diaria", "Mensual",
+    "Composicion", "Operaciones", "Datos crudos",
+])
 
 # ---- MTM DIARIO -------------------------------------------------------------
 with tab_mtm:
@@ -1001,6 +1159,146 @@ with tab_mtm:
                 holdings_full.sort_values(["subcuenta", "fecha", "emisora"]).head(3000),
                 use_container_width=True, hide_index=True,
             )
+
+
+# ---- CARTA DE POSICION ------------------------------------------------------
+with tab_carta:
+    st.subheader("Carta de Posicion - estructura identica a la hoja Posicion")
+    st.caption(
+        "Selecciona portafolio y fecha para reconstruir la hoja Posicion del "
+        "Excel a esa fecha. En cierres de mes coincide con el archivo oficial. "
+        "En fechas intermedias, los precios son de yfinance (.MX, MXN); "
+        "renta fija/reporto se valua por interpolacion del importe_neto entre "
+        "snapshots; estatica (cupon, plazo, tasa, estrategia) se hereda del "
+        "snapshot mas reciente."
+    )
+
+    if daily_mtm.empty or holdings_full.empty:
+        st.warning("Calcula MTM primero (pestana MTM Diario).")
+    else:
+        c1, c2 = st.columns([1, 1])
+        port_carta = c1.selectbox(
+            "Portafolio",
+            options=PORTFOLIOS,
+            key="carta_portfolio",
+        )
+
+        # Rango de fechas disponible
+        avail_dates = pd.DatetimeIndex(
+            sorted(daily_mtm["fecha"].dropna().unique())
+        )
+        min_d = avail_dates.min().date() if len(avail_dates) else pd.Timestamp(d_ini).date()
+        max_d = avail_dates.max().date() if len(avail_dates) else pd.Timestamp(d_fin).date()
+        target_d = c2.date_input(
+            "Fecha de la carta",
+            value=max_d,
+            min_value=min_d,
+            max_value=max_d,
+            key="carta_date",
+        )
+        target_ts = pd.Timestamp(target_d)
+
+        # Si la fecha pedida no esta en el calendario habil, buscar la mas
+        # cercana (ultimo dia habil <=)
+        if target_ts not in avail_dates:
+            le = avail_dates[avail_dates <= target_ts]
+            if len(le):
+                actual_ts = le.max()
+                st.info(
+                    f"La fecha {target_ts:%Y-%m-%d} no es dia habil. Mostrando "
+                    f"el cierre mas reciente disponible: {actual_ts:%Y-%m-%d}."
+                )
+                target_ts = actual_ts
+            else:
+                st.error("No hay datos para esa fecha.")
+                target_ts = None
+
+        if target_ts is not None:
+            df_carta, totals = reconstruct_position(
+                port_carta, target_ts, pos, holdings_full, daily_mtm
+            )
+
+            # Header estilo Excel
+            es_snap = totals["es_snapshot"]
+            st.markdown(
+                f"""
+**Contrato:** 105433  &nbsp;&nbsp;|&nbsp;&nbsp; **Cliente:** SEGUROS AZTECA  &nbsp;&nbsp;|&nbsp;&nbsp; **No. Cliente:** 1582
+**Promotor:** Miguel Angel Tebar Pedroza  &nbsp;&nbsp;|&nbsp;&nbsp; **Divisa:** MXP  &nbsp;&nbsp;|&nbsp;&nbsp; **Fecha:** {target_ts:%Y-%m-%d}
+**Producto:** Mercado de Capitales  &nbsp;&nbsp;|&nbsp;&nbsp; **Regional:** Mexico  &nbsp;&nbsp;|&nbsp;&nbsp; **Sucursal:** Corporativo  &nbsp;&nbsp;|&nbsp;&nbsp; **Subcuenta:** {port_carta}
+"""
+            )
+            if es_snap:
+                st.success(
+                    "Esta fecha es un cierre de mes oficial. La carta coincide "
+                    "con el archivo Posicion del LayOut correspondiente."
+                )
+
+            # Tabla principal con formato
+            if df_carta.empty:
+                st.warning("No hay posiciones vivas en esta fecha.")
+            else:
+                fmt = {
+                    "Cupon": "{:.2f}",
+                    "Plazo": "{:.0f}",
+                    "Tasa": "{:.4f}",
+                    "Dias x Ven": "{:.0f}",
+                    "Titulos": "{:,.0f}",
+                    "Precio": "{:,.6f}",
+                    "Importe Bruto": "${:,.2f}",
+                    "Precio Neto": "{:,.6f}",
+                    "Importe Neto": "${:,.2f}",
+                    "Precio de Mercado": "{:,.6f}",
+                    "Valor de Mercado Neto": "${:,.2f}",
+                    "Plus/Minus + Int. Dev.": "${:,.2f}",
+                    "Plus/Minus %": "{:.2%}",
+                    "% de Cartera": "{:.4%}",
+                }
+                st.dataframe(
+                    df_carta.style.format(fmt, na_rep="-"),
+                    use_container_width=True, hide_index=True,
+                )
+
+                # Footer con totales (replica las filas finales del Excel)
+                st.markdown("---")
+                ft = pd.DataFrame([
+                    {"Concepto": "Mdo.Dinero",
+                     "Valor": totals["valor_carry"]},
+                    {"Concepto": "Valor del Portafolio",
+                     "Valor": totals["valor_portafolio"]},
+                    {"Concepto": "Ef. Disponible",
+                     "Valor": totals["efectivo"]},
+                    {"Concepto": "Sdo. Disp. para Inv.*",
+                     "Valor": totals["efectivo"]},
+                    {"Concepto": "Sdo. Pend. MC", "Valor": 0.0},
+                    {"Concepto": "Ajuste de calibracion (interno)",
+                     "Valor": totals["ajuste_calibracion"]},
+                ])
+                st.dataframe(
+                    ft.style.format({"Valor": "${:,.2f}"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+                # Resumen rapido en metricas
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric(
+                    "Valor del Portafolio",
+                    f"${totals['valor_portafolio']:,.2f}",
+                )
+                c2.metric("Equities (MTM)", f"${totals['valor_equity']:,.2f}")
+                c3.metric(
+                    "Renta fija / Reporto",
+                    f"${totals['valor_carry']:,.2f}",
+                )
+                c4.metric("Efectivo", f"${totals['efectivo']:,.2f}")
+
+                # Descarga
+                st.download_button(
+                    f"Descargar carta {port_carta} {target_ts:%Y%m%d} (CSV)",
+                    df_carta.to_csv(index=False).encode("utf-8"),
+                    f"carta_posicion_{port_carta}_{target_ts:%Y%m%d}.csv",
+                    "text/csv",
+                    key=f"dl_carta_{port_carta}_{target_ts:%Y%m%d}",
+                )
 
 
 # ---- ACTIVIDAD DIARIA -------------------------------------------------------
