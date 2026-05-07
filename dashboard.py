@@ -1981,10 +1981,9 @@ with tab_compos:
                        "% del total: %{percentRoot:.2%}<extra></extra>",
     )
     fig_tree.update_layout(
-        **PLOTLY_BASE_LAYOUT,
+        **{**PLOTLY_BASE_LAYOUT, "margin": dict(l=10, r=10, t=60, b=10)},
         height=500,
         title=dict(text="<b>Distribucion por estrategia</b>", x=0.01),
-        margin=dict(l=10, r=10, t=60, b=10),
     )
     st.plotly_chart(fig_tree, use_container_width=True)
 
