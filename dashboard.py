@@ -429,18 +429,28 @@ def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame
     # 1) Descarga batch de todos los tickers .MX en UNA sola request
     out: dict[str, pd.Series] = _fetch_close_batch(list(tickers), start, end)
 
-    # 1b) Reintentar individualmente los que fallaron (rate-limiting de Yahoo
-    # es comun en Streamlit Cloud por compartir IPs). Hasta 3 intentos con
-    # backoff incremental.
+    # 1b) Reintentar los que fallaron. En Streamlit Cloud, Yahoo aplica rate
+    # limit por subnet. Estrategia: backoff exponencial + un ultimo intento
+    # con pausa larga.
     import time
     failed = [t for t in tickers if t not in out or out[t].empty]
-    for t in failed:
-        for attempt in range(3):
-            time.sleep(0.5 * (attempt + 1))
-            s = _fetch_close(t, start, end)
-            if s is not None and not s.empty:
-                out[t] = s
-                break
+    if failed:
+        # Primer round: 3 intentos con delays crecientes
+        for t in list(failed):
+            for attempt in range(3):
+                time.sleep(1.0 + 0.7 * attempt)  # 1.0s, 1.7s, 2.4s
+                s = _fetch_close(t, start, end)
+                if s is not None and not s.empty:
+                    out[t] = s
+                    failed.remove(t)
+                    break
+        # Segundo round (los todavia fallidos): pausa larga y un retry batch
+        if failed:
+            time.sleep(5.0)
+            recovery = _fetch_close_batch(failed, start, end)
+            for t, s in recovery.items():
+                if s is not None and not s.empty:
+                    out[t] = s
 
     # 2) Para los SC cross-listed: USD x USDMXN es la fuente PRIMARIA
     # (NYSE liquidez real = sin outliers de baja liquidez en SIC). El .MX
@@ -449,16 +459,23 @@ def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame
     if sc_requested:
         usd_needed = sorted({SC_USD_FALLBACK[t] for t in sc_requested})
         usd_universe = usd_needed + [FX_TICKER]
-        # Batch + reintentos individuales
+        # Batch + reintentos individuales con backoff
         usd_data: dict[str, pd.Series] = _fetch_close_batch(usd_universe, start, end)
         usd_failed = [t for t in usd_universe if t not in usd_data or usd_data[t].empty]
-        for t in usd_failed:
+        for t in list(usd_failed):
             for attempt in range(3):
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(1.0 + 0.7 * attempt)
                 s = _fetch_close(t, start, end)
                 if s is not None and not s.empty:
                     usd_data[t] = s
+                    usd_failed.remove(t)
                     break
+        if usd_failed:
+            time.sleep(5.0)
+            recovery = _fetch_close_batch(usd_failed, start, end)
+            for t, s in recovery.items():
+                if s is not None and not s.empty:
+                    usd_data[t] = s
 
         if FX_TICKER in usd_data:
             fx = usd_data[FX_TICKER]
@@ -803,8 +820,10 @@ def compute_bond_values_daily(
             amorts["monto_neto"] = pd.to_numeric(amorts["monto_neto"], errors="coerce").fillna(0)
             amorts = amorts.drop_duplicates(["folio", "fecha_liq", "monto_neto"])
             cf_by_date = amorts.groupby("fecha_liq")["monto_neto"].sum()
+            cf_by_date.index = pd.to_datetime(cf_by_date.index)
         else:
-            cf_by_date = pd.Series(dtype=float)
+            # Empty series with DatetimeIndex (no RangeIndex which fails comparison)
+            cf_by_date = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
 
         # Inicializar serie diaria
         ser = pd.Series(np.nan, index=dates_idx)
