@@ -414,6 +414,38 @@ def _fetch_close(ticker: str, start: str, end: str) -> pd.Series | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Cache de precios en disco
+# ---------------------------------------------------------------------------
+# El dashboard no descarga precios de Yahoo en cada carga: lee del CSV
+# `prices/precios_diarios.csv` que se mantiene committeado en el repo.
+# Cuando agregas un mes nuevo de archivos LayOut*.xlsm, corres localmente
+# `python update_prices.py` y el script actualiza el CSV con los dias
+# faltantes. Luego `git push` y Streamlit Cloud usa los precios nuevos
+# sin tocar Yahoo.
+PRICES_CSV = Path(__file__).parent / "prices" / "precios_diarios.csv"
+
+
+def _load_cached_prices() -> pd.DataFrame:
+    """Carga el CSV de precios cacheados. Devuelve DataFrame wide
+    (index=fecha, columnas=tickers). Vacio si no existe."""
+    if not PRICES_CSV.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(PRICES_CSV, parse_dates=["fecha"], index_col="fecha")
+        return df.sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _save_cached_prices(df: pd.DataFrame) -> None:
+    """Guarda el DataFrame de precios al CSV (sobreescribe)."""
+    PRICES_CSV.parent.mkdir(parents=True, exist_ok=True)
+    df = df.copy()
+    df.index.name = "fecha"
+    df.sort_index().to_csv(PRICES_CSV)
+
+
 @st.cache_data(ttl=24 * 3600, show_spinner="Descargando precios de yfinance...")
 def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame:
     """Devuelve DataFrame con index=fecha, columnas=tickers, valores=precio cierre ajustado.
@@ -425,6 +457,30 @@ def fetch_prices(tickers: tuple[str, ...], start: str, end: str) -> pd.DataFrame
     """
     if not tickers:
         return pd.DataFrame()
+
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+
+    # 0) Intentar servir desde cache en disco (precios/precios_diarios.csv)
+    cached = _load_cached_prices()
+    if not cached.empty:
+        # Verificar cobertura: todos los tickers solicitados estan, y la
+        # ultima fecha cacheada cubre o casi cubre el end_ts.
+        tickers_in_cache = [t for t in tickers if t in cached.columns]
+        last_cached = cached.index.max()
+        # Buffer de 3 dias habiles: si end_ts esta dentro de ultimo + 3
+        # dias, consideramos que el cache es suficiente.
+        cache_recent_enough = last_cached >= end_ts - pd.Timedelta(days=3)
+        all_tickers_present = len(tickers_in_cache) == len(tickers)
+
+        if all_tickers_present and cache_recent_enough:
+            # 100% servido desde cache, cero llamadas a Yahoo
+            out_df = cached.loc[
+                (cached.index >= start_ts) & (cached.index <= end_ts),
+                tickers_in_cache,
+            ]
+            if not out_df.empty:
+                return out_df
 
     # 1) Descarga batch de todos los tickers .MX en UNA sola request
     out: dict[str, pd.Series] = _fetch_close_batch(list(tickers), start, end)
