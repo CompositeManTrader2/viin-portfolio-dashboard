@@ -739,6 +739,144 @@ def compute_repo_values_daily(
     return df
 
 
+def compute_bond_values_daily(
+    pos: pd.DataFrame, mov: pd.DataFrame, dates: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """Valuacion diaria exacta de bonos (TP=D) por simulacion entre snapshots.
+
+    Modelo:
+      Entre dos snapshots consecutivos t0 y t1:
+        valor[t0] = importe_neto[t0]  (anchor)
+        valor[t1] = importe_neto[t1]  (cierre)
+        Cashflows discretos en (t0, t1]: amortizaciones (parciales y totales).
+        Cupones NO afectan importe_neto (solo entran a cash; el dirty price
+        del bono no incluye el cupon una vez pagado).
+
+      Drift continuo total = (valor[t1] - valor[t0]) + sum(amortizaciones)
+        - Refleja devengo + cambios de clean price.
+        - Se distribuye linealmente por dia.
+
+      Para cada dia d en (t0, t1):
+        valor[d] = valor[t0] + drift_per_day * (d - t0)
+                              - sum(amortizaciones liquidadas en [t0+1, d])
+
+    Esto cierra exactamente en cada snapshot por construccion.
+
+    Si el bono desaparece en t1 (titulos a 0): bond_imp_full[t1] = 0 y la
+    diferencia entre t0 y t1 se distribuye igualmente, con la amortizacion
+    final aplicandose en su fecha exacta.
+    """
+    bonds_pos = pos[pos["tp"] == "D"].copy()
+    if bonds_pos.empty:
+        return pd.DataFrame(
+            columns=["fecha", "subcuenta", "emisora", "serie", "tp", "importe_neto"]
+        )
+
+    bonds_pos["serie_n"] = bonds_pos["serie"].astype(str).str.strip()
+
+    out_rows = []
+    dates_idx = pd.DatetimeIndex(dates)
+
+    for (port, emi, serie_n), grp in bonds_pos.groupby(
+        ["subcuenta", "emisora", "serie_n"]
+    ):
+        # Snapshots del PORTAFOLIO (no solo del bono): para que cuando el bono
+        # desaparezca, ese snapshot anchor el valor a 0.
+        port_snaps = sorted(
+            pd.Timestamp(d) for d in pos[pos["subcuenta"] == port]["fecha"].dropna().unique()
+        )
+        if not port_snaps:
+            continue
+
+        bond_imp = grp.set_index("fecha")["importe_neto"].astype(float)
+        bond_imp_full = bond_imp.reindex(port_snaps).fillna(0.0)
+
+        # Amortizaciones del bono (parciales y totales). Dedup por (folio, fecha_liq).
+        amorts = mov[
+            (mov["subcuenta"] == port)
+            & (mov["emisora"] == emi)
+            & (mov["serie"].astype(str).str.strip() == serie_n)
+            & (mov["concepto"] == "AMORTIZACION")
+        ][["fecha_liq", "folio", "monto_neto"]].dropna(subset=["fecha_liq"]).copy()
+        if not amorts.empty:
+            amorts["fecha_liq"] = pd.to_datetime(amorts["fecha_liq"])
+            amorts["monto_neto"] = pd.to_numeric(amorts["monto_neto"], errors="coerce").fillna(0)
+            amorts = amorts.drop_duplicates(["folio", "fecha_liq", "monto_neto"])
+            cf_by_date = amorts.groupby("fecha_liq")["monto_neto"].sum()
+        else:
+            cf_by_date = pd.Series(dtype=float)
+
+        # Inicializar serie diaria
+        ser = pd.Series(np.nan, index=dates_idx)
+        # Anchor en cada snapshot
+        for t in port_snaps:
+            if t in ser.index:
+                ser.loc[t] = float(bond_imp_full.loc[t])
+
+        # Simulacion entre cada par consecutivo
+        for i in range(len(port_snaps) - 1):
+            t0 = port_snaps[i]
+            t1 = port_snaps[i + 1]
+            v0 = float(bond_imp_full.loc[t0])
+            v1 = float(bond_imp_full.loc[t1])
+            num_days = (t1 - t0).days
+            if num_days <= 0:
+                continue
+
+            # CF en (t0, t1]
+            cf_in_period = cf_by_date[
+                (cf_by_date.index > t0) & (cf_by_date.index <= t1)
+            ]
+            cf_total = float(cf_in_period.sum())
+
+            # Caso degenerado: bono no existe en ambos extremos
+            if v0 == 0 and v1 == 0 and cf_total == 0:
+                between = dates_idx[(dates_idx > t0) & (dates_idx < t1)]
+                ser.loc[between] = 0.0
+                continue
+
+            drift_total = v1 - v0 + cf_total
+            drift_per_day = drift_total / num_days
+
+            # Walk forward dia por dia
+            current = v0
+            current_date = t0
+            between = sorted(dates_idx[(dates_idx > t0) & (dates_idx < t1)])
+            for d in between:
+                days_elapsed = (d - current_date).days
+                current += drift_per_day * days_elapsed
+                # Aplicar amortizacion del dia (si existe)
+                if d in cf_by_date.index:
+                    current -= float(cf_by_date.loc[d])
+                current_date = d
+                ser.loc[d] = current
+
+        # Antes del primer snapshot: 0
+        before_first = dates_idx[dates_idx < port_snaps[0]]
+        for d in before_first:
+            ser.loc[d] = 0.0
+
+        # Despues del ultimo snapshot: mantener valor del ultimo snapshot
+        last_v = float(bond_imp_full.loc[port_snaps[-1]])
+        after_last = dates_idx[dates_idx > port_snaps[-1]]
+        for d in after_last:
+            if pd.isna(ser.loc[d]):
+                ser.loc[d] = last_v
+
+        for d, v in ser.items():
+            if pd.notna(v):
+                out_rows.append({
+                    "fecha": d,
+                    "subcuenta": port,
+                    "emisora": emi,
+                    "serie": serie_n,
+                    "tp": "D",
+                    "importe_neto": float(v),
+                })
+
+    return pd.DataFrame(out_rows)
+
+
 def carry_values_daily(
     pos: pd.DataFrame, mov: pd.DataFrame, dates: pd.DatetimeIndex
 ) -> pd.DataFrame:
@@ -751,43 +889,69 @@ def carry_values_daily(
     """
     base = interpolate_importe_neto(pos, dates)
     repos_exact = compute_repo_values_daily(mov, dates)
-    if repos_exact.empty:
-        return base
+    bonds_exact = compute_bond_values_daily(pos, mov, dates)
+
+    # Caso degenerado: nada que combinar
+    if base.empty and repos_exact.empty and bonds_exact.empty:
+        return pd.DataFrame(
+            columns=["fecha", "subcuenta", "emisora", "serie", "tp", "importe_neto"]
+        )
+
     if base.empty:
-        # Solo repos
-        repos_exact = repos_exact.rename(columns={"valor_repo": "importe_neto"})
-        return repos_exact[
-            ["fecha", "subcuenta", "emisora", "serie", "tp", "importe_neto"]
-        ]
+        base = pd.DataFrame(
+            columns=["fecha", "subcuenta", "emisora", "serie", "tp", "importe_neto"]
+        )
 
     base = base.copy()
     base["serie_n"] = base["serie"].astype(str).str.strip()
-    repos_exact = repos_exact.copy()
-    repos_exact["serie_n"] = repos_exact["serie"].astype(str).str.strip()
 
-    # Outer merge para capturar repos intra-mes ausentes en snapshots
-    merged = base.merge(
-        repos_exact[["fecha", "subcuenta", "emisora", "serie_n", "tp", "valor_repo"]],
-        on=["fecha", "subcuenta", "emisora", "serie_n", "tp"],
-        how="outer",
-        indicator=True,
-    )
+    # ---- Reemplazar TP=R con valuacion exacta de reportos ----
+    if not repos_exact.empty:
+        repos_exact = repos_exact.copy()
+        repos_exact["serie_n"] = repos_exact["serie"].astype(str).str.strip()
+        merged = base.merge(
+            repos_exact[
+                ["fecha", "subcuenta", "emisora", "serie_n", "tp", "valor_repo"]
+            ],
+            on=["fecha", "subcuenta", "emisora", "serie_n", "tp"],
+            how="outer",
+            indicator="_repo_merge",
+        )
+        is_repo_exact = (merged["tp"] == "R") & merged["valor_repo"].notna()
+        merged["importe_neto"] = np.where(
+            is_repo_exact,
+            merged["valor_repo"],
+            merged["importe_neto"],
+        )
+        only_repo = merged["_repo_merge"] == "right_only"
+        merged.loc[only_repo, "serie"] = merged.loc[only_repo, "serie_n"]
+        base = merged.drop(columns=["valor_repo", "_repo_merge"])
 
-    # Para TP=R con valor exacto disponible: reemplazar
-    is_repo_exact = (merged["tp"] == "R") & merged["valor_repo"].notna()
-    merged["importe_neto"] = np.where(
-        is_repo_exact,
-        merged["valor_repo"],
-        merged["importe_neto"],
-    )
+    # ---- Reemplazar TP=D con valuacion exacta de bonos ----
+    if not bonds_exact.empty:
+        bonds_exact = bonds_exact.copy()
+        bonds_exact["serie_n"] = bonds_exact["serie"].astype(str).str.strip()
+        merged = base.merge(
+            bonds_exact[
+                ["fecha", "subcuenta", "emisora", "serie_n", "tp", "importe_neto"]
+            ].rename(columns={"importe_neto": "importe_bond_exact"}),
+            on=["fecha", "subcuenta", "emisora", "serie_n", "tp"],
+            how="outer",
+            indicator="_bond_merge",
+        )
+        is_bond_exact = (merged["tp"] == "D") & merged["importe_bond_exact"].notna()
+        merged["importe_neto"] = np.where(
+            is_bond_exact,
+            merged["importe_bond_exact"],
+            merged["importe_neto"],
+        )
+        only_bond = merged["_bond_merge"] == "right_only"
+        merged.loc[only_bond, "serie"] = merged.loc[only_bond, "serie_n"]
+        base = merged.drop(columns=["importe_bond_exact", "_bond_merge"])
 
-    # Si la fila viene solo de repos_exact, llenar serie desde serie_n
-    only_repo = merged["_merge"] == "right_only"
-    merged.loc[only_repo, "serie"] = merged.loc[only_repo, "serie_n"]
-
-    merged = merged.drop(columns=["serie_n", "valor_repo", "_merge"])
-    merged = merged.dropna(subset=["importe_neto"])
-    return merged
+    base = base.drop(columns=["serie_n"])
+    base = base.dropna(subset=["importe_neto"])
+    return base
 
 
 def daily_cash(mov: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame:
@@ -1654,8 +1818,6 @@ with tab_carta:
                     {"Concepto": "Sdo. Disp. para Inv.*",
                      "Valor": totals["efectivo"]},
                     {"Concepto": "Sdo. Pend. MC", "Valor": 0.0},
-                    {"Concepto": "Ajuste de calibracion (interno)",
-                     "Valor": totals["ajuste_calibracion"]},
                 ])
                 st.dataframe(
                     ft.style.format({"Valor": "${:,.2f}"}),
