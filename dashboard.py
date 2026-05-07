@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import yfinance as yf
 
@@ -38,6 +39,69 @@ TOTAL_LABELS = {
 }
 
 st.set_page_config(page_title="Portafolios VIIN", layout="wide")
+
+# ---------------------------------------------------------------------------
+# Paleta y helpers de visualizacion
+# ---------------------------------------------------------------------------
+PORT_COLORS = {
+    "VIIN000000000001": "#1f4e79",  # azul oscuro
+    "VIIN000000000003": "#d97706",  # naranja
+    "VIIN000000000006": "#059669",  # verde
+}
+PORT_LABEL = {
+    "VIIN000000000001": "VIIN ...001",
+    "VIIN000000000003": "VIIN ...003",
+    "VIIN000000000006": "VIIN ...006",
+}
+COMP_COLORS = {
+    "Equities": "#2563eb",
+    "Renta fija / Reporto": "#7c3aed",
+    "Efectivo": "#10b981",
+    "Ajuste": "#94a3b8",
+}
+GREEN = "#16a34a"
+RED = "#dc2626"
+GRID = "#e5e7eb"
+
+PLOTLY_BASE_LAYOUT = dict(
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font=dict(family="-apple-system, system-ui, sans-serif", size=12, color="#1f2937"),
+    margin=dict(l=60, r=20, t=60, b=40),
+    hoverlabel=dict(bgcolor="white", font_size=12, bordercolor="#e5e7eb"),
+)
+
+
+def fmt_money(v: float, compact: bool = True) -> str:
+    """$1.23M / $456K / $789"""
+    if pd.isna(v):
+        return "-"
+    av = abs(v)
+    sign = "-" if v < 0 else ""
+    if compact and av >= 1e6:
+        return f"{sign}${av/1e6:,.2f}M"
+    if compact and av >= 1e3:
+        return f"{sign}${av/1e3:,.1f}K"
+    return f"{sign}${av:,.2f}"
+
+
+def style_axes(fig: go.Figure, money_y: bool = False, pct_y: bool = False) -> go.Figure:
+    fig.update_xaxes(
+        gridcolor=GRID, zerolinecolor=GRID, showline=True,
+        linecolor="#9ca3af", linewidth=1, ticks="outside", tickcolor="#9ca3af",
+    )
+    yfmt = ",.0f"
+    if money_y:
+        # plotly-friendly money format using SI suffix
+        yfmt = "$,.2s"
+    if pct_y:
+        yfmt = ".2%"
+    fig.update_yaxes(
+        gridcolor=GRID, zerolinecolor="#9ca3af", showline=True,
+        linecolor="#9ca3af", linewidth=1, ticks="outside", tickcolor="#9ca3af",
+        tickformat=yfmt,
+    )
+    return fig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1167,28 +1231,58 @@ with tab_mtm:
     if daily_mtm.empty:
         st.warning("No hay datos suficientes para calcular MTM en el rango seleccionado.")
     else:
-        # ---- Grafica principal: valor total por dia ----
-        fig_total = px.line(
-            daily_mtm, x="fecha", y="valor_total", color="subcuenta",
-            title="Valor total diario por portafolio (MXN, calibrado)",
-        )
-        # Marcar fechas de snapshot con puntos
         snap_dates_in_range = sorted(
             d for d in pos_f["fecha"].dropna().unique()
             if pd.Timestamp(d) >= pd.Timestamp(s_date)
             and pd.Timestamp(d) <= pd.Timestamp(e_date)
         )
-        for port in daily_mtm["subcuenta"].unique():
-            sub = daily_mtm[
-                (daily_mtm["subcuenta"] == port)
-                & (daily_mtm["fecha"].isin(snap_dates_in_range))
-            ]
+
+        # ---- Grafica principal: 3 paneles, escala independiente ----
+        ports_in_data = [p for p in PORTFOLIOS if p in daily_mtm["subcuenta"].unique()]
+        fig_total = make_subplots(
+            rows=len(ports_in_data), cols=1, shared_xaxes=True,
+            subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_data],
+            vertical_spacing=0.06,
+        )
+        for i, p in enumerate(ports_in_data, 1):
+            sub = daily_mtm[daily_mtm["subcuenta"] == p].sort_values("fecha")
+            color = PORT_COLORS.get(p, "#374151")
+            # Linea continua
             fig_total.add_trace(go.Scatter(
                 x=sub["fecha"], y=sub["valor_total"],
-                mode="markers", marker=dict(size=8, symbol="diamond"),
-                name=f"{port} (snapshot)", showlegend=False,
-            ))
-        fig_total.update_layout(yaxis_tickformat=",.0f", legend_title="")
+                mode="lines",
+                line=dict(color=color, width=2),
+                fill="tozeroy", fillcolor=f"rgba(31,78,121,0.05)" if p == "VIIN000000000001"
+                    else (f"rgba(217,119,6,0.05)" if p == "VIIN000000000003"
+                    else f"rgba(5,150,105,0.05)"),
+                name=p, showlegend=False,
+                hovertemplate="<b>%{x|%d %b %Y}</b><br>Valor: $%{y:,.0f}<extra></extra>",
+            ), row=i, col=1)
+            # Snapshots como diamantes con anotacion del valor
+            snaps = sub[sub["fecha"].isin(snap_dates_in_range)]
+            fig_total.add_trace(go.Scatter(
+                x=snaps["fecha"], y=snaps["valor_total"],
+                mode="markers",
+                marker=dict(symbol="diamond", size=10, color=color,
+                            line=dict(color="white", width=2)),
+                name=f"{p} snap", showlegend=False,
+                hovertemplate="<b>Cierre %{x|%b %Y}</b><br>Oficial: $%{y:,.0f}<extra></extra>",
+            ), row=i, col=1)
+            # Y-axis money format
+            fig_total.update_yaxes(tickprefix="$", tickformat=",.2s",
+                                    gridcolor=GRID, zerolinecolor=GRID,
+                                    row=i, col=1)
+            fig_total.update_xaxes(gridcolor=GRID, zerolinecolor=GRID, row=i, col=1)
+        fig_total.update_layout(
+            **PLOTLY_BASE_LAYOUT,
+            height=220 * len(ports_in_data) + 80,
+            title=dict(
+                text="<b>Valor diario por portafolio</b>"
+                     "<br><sub>Escalas independientes - diamantes marcan cierres oficiales (Posicion)</sub>",
+                x=0.01, xanchor="left",
+            ),
+            hovermode="x unified",
+        )
         st.plotly_chart(fig_total, use_container_width=True)
 
         # ---- Auditoria de calibracion ----
@@ -1287,54 +1381,132 @@ with tab_mtm:
         )
 
         # ---- Descomposicion stacked por componente ----
-        st.subheader(f"Descomposicion diaria - {port_pick}")
+        st.subheader(f"Composicion diaria - {PORT_LABEL.get(port_pick, port_pick)}")
+        st.caption(
+            "Cada banda muestra cuanto contribuye cada clase de activo al valor "
+            "total del dia. La banda gris (Ajuste) deberia ser delgada y oscilar "
+            "alrededor de cero — refleja diferencias residuales tras la calibracion."
+        )
         fig_dec = go.Figure()
         fig_dec.add_trace(go.Scatter(
             x=sub["fecha"], y=sub["valor_equity"],
-            stackgroup="one", name="Equities (yfinance)",
+            stackgroup="one", name="Equities",
+            line=dict(width=0), fillcolor="rgba(37,99,235,0.85)",
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Equities: $%{y:,.0f}<extra></extra>",
         ))
         fig_dec.add_trace(go.Scatter(
             x=sub["fecha"], y=sub["valor_carry"],
-            stackgroup="one", name="Renta fija / Reporto (carry)",
+            stackgroup="one", name="Renta fija / Reporto",
+            line=dict(width=0), fillcolor="rgba(124,58,237,0.85)",
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>RF/Repo: $%{y:,.0f}<extra></extra>",
         ))
         fig_dec.add_trace(go.Scatter(
             x=sub["fecha"], y=sub["efectivo"],
             stackgroup="one", name="Efectivo",
+            line=dict(width=0), fillcolor="rgba(16,185,129,0.85)",
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Cash: $%{y:,.0f}<extra></extra>",
         ))
         fig_dec.add_trace(go.Scatter(
             x=sub["fecha"], y=sub["ajuste_calibracion"],
-            stackgroup="one", name="Ajuste de calibracion",
+            stackgroup="one", name="Ajuste",
+            line=dict(width=0), fillcolor="rgba(148,163,184,0.7)",
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Ajuste: $%{y:,.0f}<extra></extra>",
         ))
         fig_dec.update_layout(
-            yaxis_tickformat=",.0f",
-            title=f"{port_pick} - Composicion diaria del valor",
-            legend_title="",
+            **PLOTLY_BASE_LAYOUT,
+            height=420,
+            title=dict(
+                text=f"<b>{PORT_LABEL.get(port_pick, port_pick)} - composicion diaria</b>",
+                x=0.01, xanchor="left",
+            ),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
         )
+        fig_dec.update_yaxes(tickprefix="$", tickformat=",.2s",
+                              gridcolor=GRID, zerolinecolor=GRID)
+        fig_dec.update_xaxes(gridcolor=GRID, zerolinecolor=GRID)
         st.plotly_chart(fig_dec, use_container_width=True)
 
-        # ---- Rendimiento diario ----
-        st.subheader("Rendimiento diario (% sobre valor del dia anterior)")
+        # ---- Rendimiento diario % ----
+        st.subheader("Rendimiento diario por portafolio")
+        st.caption(
+            "Cambio porcentual del valor total respecto al dia anterior. "
+            "Verde = ganancia, rojo = perdida. Una linea horizontal en 0% "
+            "facilita ver dias buenos vs malos."
+        )
         ret = daily_mtm.sort_values(["subcuenta", "fecha"]).copy()
         ret["valor_lag"] = ret.groupby("subcuenta")["valor_total"].shift(1)
         ret["ret_pct"] = ret["valor_total"] / ret["valor_lag"] - 1
         ret = ret.dropna(subset=["ret_pct"])
-        fig_ret = px.line(
-            ret, x="fecha", y="ret_pct", color="subcuenta",
-            title="% Diario",
+
+        fig_ret = make_subplots(
+            rows=len(ports_in_data), cols=1, shared_xaxes=True,
+            subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_data],
+            vertical_spacing=0.06,
         )
-        fig_ret.update_layout(yaxis_tickformat=".2%")
+        for i, p in enumerate(ports_in_data, 1):
+            r = ret[ret["subcuenta"] == p].sort_values("fecha")
+            colors = [GREEN if v >= 0 else RED for v in r["ret_pct"]]
+            fig_ret.add_trace(go.Bar(
+                x=r["fecha"], y=r["ret_pct"],
+                marker=dict(color=colors, line=dict(width=0)),
+                showlegend=False,
+                hovertemplate="<b>%{x|%d %b %Y}</b><br>%{y:.2%}<extra></extra>",
+            ), row=i, col=1)
+            fig_ret.add_hline(y=0, line=dict(color="#9ca3af", width=1), row=i, col=1)
+            fig_ret.update_yaxes(tickformat=".1%", gridcolor=GRID,
+                                  zerolinecolor="#9ca3af", row=i, col=1)
+            fig_ret.update_xaxes(gridcolor=GRID, row=i, col=1)
+        fig_ret.update_layout(
+            **PLOTLY_BASE_LAYOUT,
+            height=180 * len(ports_in_data) + 80,
+            title=dict(
+                text="<b>Rendimiento diario %</b>",
+                x=0.01, xanchor="left",
+            ),
+            hovermode="x unified",
+            bargap=0.1,
+        )
         st.plotly_chart(fig_ret, use_container_width=True)
 
         # ---- Indice base 100 ----
-        st.subheader("Indice base 100 (rendimiento acumulado)")
+        st.subheader("Indice acumulado base 100")
+        st.caption(
+            "Normaliza los 3 portafolios al primer dia = 100 para que sean "
+            "comparables sin importar su tamaño. Linea horizontal en 100 = "
+            "punto de partida."
+        )
         idx = daily_mtm.sort_values(["subcuenta", "fecha"]).copy()
         first_vals = idx.groupby("subcuenta")["valor_total"].transform("first")
         idx["index_100"] = idx["valor_total"] / first_vals * 100
-        fig_idx = px.line(
-            idx, x="fecha", y="index_100", color="subcuenta",
-            title="Indice de retorno (1er dia = 100)",
+
+        fig_idx = go.Figure()
+        for p in ports_in_data:
+            sub_i = idx[idx["subcuenta"] == p].sort_values("fecha")
+            color = PORT_COLORS.get(p, "#374151")
+            fig_idx.add_trace(go.Scatter(
+                x=sub_i["fecha"], y=sub_i["index_100"],
+                mode="lines",
+                line=dict(color=color, width=2.5),
+                name=PORT_LABEL.get(p, p),
+                hovertemplate=f"<b>{PORT_LABEL.get(p, p)}</b><br>%{{x|%d %b %Y}}<br>"
+                              f"Indice: %{{y:.2f}}<br>"
+                              f"Retorno: %{{customdata:.2%}}<extra></extra>",
+                customdata=(sub_i["index_100"]/100 - 1),
+            ))
+        fig_idx.add_hline(y=100, line=dict(color="#9ca3af", width=1, dash="dash"))
+        fig_idx.update_layout(
+            **PLOTLY_BASE_LAYOUT,
+            height=420,
+            title=dict(
+                text="<b>Indice acumulado (1er dia = 100)</b>",
+                x=0.01, xanchor="left",
+            ),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
         )
-        fig_idx.update_layout(yaxis_tickformat=",.1f")
+        fig_idx.update_yaxes(tickformat=",.1f", gridcolor=GRID, zerolinecolor=GRID)
+        fig_idx.update_xaxes(gridcolor=GRID, zerolinecolor=GRID)
         st.plotly_chart(fig_idx, use_container_width=True)
 
         # ---- Resumen del periodo ----
@@ -1520,174 +1692,561 @@ with tab_carta:
 
 # ---- ACTIVIDAD DIARIA -------------------------------------------------------
 with tab_actividad:
-    st.subheader("Saldo de efectivo diario (Movimientos.Saldo, ultimo del dia)")
-    # Para cada (subcuenta, fecha_op) tomamos el ultimo Saldo registrado
-    # Asumimos orden por archivo + folio + posicion en hoja
     mov_f = mov_f.sort_values(["subcuenta", "fecha_op", "folio"])
+    ports_in_act = [p for p in PORTFOLIOS if p in mov_f["subcuenta"].unique()]
+
+    # ---- Saldo de efectivo diario ----
+    st.subheader("Saldo de efectivo al cierre de cada dia")
+    st.caption(
+        "Saldo en cuenta despues de la ultima operacion liquidada del dia. "
+        "Cuando hay un reporto abierto, el efectivo es bajo (la mayoria del "
+        "dinero esta invertido en el reporto)."
+    )
     daily_saldo = (
         mov_f.dropna(subset=["fecha_op", "saldo"])
         .groupby(["subcuenta", "fecha_op"], as_index=False)
         .agg(saldo=("saldo", "last"))
     )
-    fig = px.line(
-        daily_saldo, x="fecha_op", y="saldo", color="subcuenta",
-        markers=False, title="Saldo de efectivo (cierre de dia)",
-    )
-    fig.update_layout(yaxis_tickformat=",.0f", legend_title="")
-    st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Flujo de efectivo neto diario")
+    fig_sal = make_subplots(
+        rows=len(ports_in_act), cols=1, shared_xaxes=True,
+        subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_act],
+        vertical_spacing=0.06,
+    )
+    for i, p in enumerate(ports_in_act, 1):
+        d = daily_saldo[daily_saldo["subcuenta"] == p].sort_values("fecha_op")
+        color = PORT_COLORS.get(p, "#374151")
+        fig_sal.add_trace(go.Scatter(
+            x=d["fecha_op"], y=d["saldo"],
+            mode="lines",
+            line=dict(color=color, width=1.5),
+            showlegend=False,
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>Saldo: $%{y:,.2f}<extra></extra>",
+        ), row=i, col=1)
+        fig_sal.add_hline(y=0, line=dict(color="#9ca3af", width=1, dash="dash"),
+                           row=i, col=1)
+        fig_sal.update_yaxes(tickprefix="$", tickformat=",.2s",
+                              gridcolor=GRID, zerolinecolor="#9ca3af",
+                              row=i, col=1)
+        fig_sal.update_xaxes(gridcolor=GRID, row=i, col=1)
+    fig_sal.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=180 * len(ports_in_act) + 80,
+        title=dict(text="<b>Saldo en efectivo - cierre diario</b>", x=0.01),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_sal, use_container_width=True)
+
+    # ---- Flujo neto diario (entradas - salidas) ----
+    st.subheader("Flujo de efectivo neto por dia")
+    st.caption(
+        "Entradas (verde) y salidas (rojo) netas de efectivo cada dia. "
+        "Incluye apertura/vencimiento de reportos, dividendos, cupones, "
+        "comisiones, etc. Las barras grandes suelen ser apertura/cierre de "
+        "reportos del mismo dia."
+    )
     daily_flow = (
         mov_f.dropna(subset=["fecha_op"])
         .groupby(["subcuenta", "fecha_op"], as_index=False)["flujo_efectivo"]
         .sum()
     )
-    fig2 = px.bar(
-        daily_flow, x="fecha_op", y="flujo_efectivo", color="subcuenta",
-        barmode="group", title="Entradas (+) y salidas (-) netas",
-    )
-    fig2.update_layout(yaxis_tickformat=",.0f")
-    st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("Intereses devengados diarios (REPORTO: VEN.COMPRA REPORTO)")
-    # Premio/intereses generados al vencimiento del reporto: monto_neto cuando concepto=VEN.COMPRA REPORTO
-    # signo "+" = ingreso de premio. Aprox: usamos columna tasa_premio * dias / 360 * monto pero
-    # mas simple: tasa_premio en col J en el VEN.COMPRA es el premio bruto en MXN.
+    fig_fl = make_subplots(
+        rows=len(ports_in_act), cols=1, shared_xaxes=True,
+        subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_act],
+        vertical_spacing=0.06,
+    )
+    for i, p in enumerate(ports_in_act, 1):
+        d = daily_flow[daily_flow["subcuenta"] == p].sort_values("fecha_op")
+        colors = [GREEN if v >= 0 else RED for v in d["flujo_efectivo"]]
+        fig_fl.add_trace(go.Bar(
+            x=d["fecha_op"], y=d["flujo_efectivo"],
+            marker=dict(color=colors, line=dict(width=0)),
+            showlegend=False,
+            hovertemplate="<b>%{x|%d %b %Y}</b><br>$%{y:,.2f}<extra></extra>",
+        ), row=i, col=1)
+        fig_fl.add_hline(y=0, line=dict(color="#9ca3af", width=1), row=i, col=1)
+        fig_fl.update_yaxes(tickprefix="$", tickformat=",.2s",
+                             gridcolor=GRID, zerolinecolor="#9ca3af",
+                             row=i, col=1)
+        fig_fl.update_xaxes(gridcolor=GRID, row=i, col=1)
+    fig_fl.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=180 * len(ports_in_act) + 80,
+        title=dict(text="<b>Flujo de efectivo neto diario</b>", x=0.01),
+    )
+    st.plotly_chart(fig_fl, use_container_width=True)
+
+    # ---- Premio de reporto diario y acumulado ----
+    st.subheader("Premio de reporto (intereses devengados)")
+    st.caption(
+        "El premio que se paga al vencer cada reporto (col `Tasa /Premio` "
+        "en VEN.COMPRA REPORTO). Es el ingreso por mantener el dinero "
+        "invertido en money market. Se muestra el acumulado acumulado."
+    )
     int_df = mov_f[mov_f["concepto"] == "VEN.COMPRA REPORTO"].copy()
     int_df["interes"] = int_df["tasa_premio"]
     int_daily = (
         int_df.groupby(["subcuenta", "fecha_op"], as_index=False)["interes"].sum()
     )
-    fig3 = px.area(
-        int_daily, x="fecha_op", y="interes", color="subcuenta",
-        title="Premio reporto diario (MXN)",
-    )
-    fig3.update_layout(yaxis_tickformat=",.0f")
-    st.plotly_chart(fig3, use_container_width=True)
-
     cum = int_daily.sort_values("fecha_op").copy()
     cum["interes_acum"] = cum.groupby("subcuenta")["interes"].cumsum()
-    fig3b = px.line(
-        cum, x="fecha_op", y="interes_acum", color="subcuenta",
-        title="Premio reporto acumulado (MXN)",
+
+    fig_int = go.Figure()
+    for p in ports_in_act:
+        sub_c = cum[cum["subcuenta"] == p].sort_values("fecha_op")
+        color = PORT_COLORS.get(p, "#374151")
+        fig_int.add_trace(go.Scatter(
+            x=sub_c["fecha_op"], y=sub_c["interes_acum"],
+            mode="lines",
+            line=dict(color=color, width=2.5),
+            name=PORT_LABEL.get(p, p),
+            fill="tozeroy",
+            fillcolor=color.replace("rgb", "rgba").replace(")", ",0.08)") if "rgb" in color
+                       else f"rgba(31,78,121,0.06)",
+            hovertemplate=f"<b>{PORT_LABEL.get(p, p)}</b><br>%{{x|%d %b %Y}}<br>"
+                           f"Acumulado: $%{{y:,.2f}}<extra></extra>",
+        ))
+    fig_int.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=420,
+        title=dict(text="<b>Premio de reporto acumulado</b>", x=0.01),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
     )
-    fig3b.update_layout(yaxis_tickformat=",.0f")
-    st.plotly_chart(fig3b, use_container_width=True)
+    fig_int.update_yaxes(tickprefix="$", tickformat=",.2s",
+                          gridcolor=GRID, zerolinecolor=GRID)
+    fig_int.update_xaxes(gridcolor=GRID)
+    st.plotly_chart(fig_int, use_container_width=True)
+
+    # Resumen del periodo
+    resumen = cum.groupby("subcuenta", as_index=False)["interes_acum"].max()
+    resumen.columns = ["Portafolio", "Premio total acumulado"]
+    resumen["Portafolio"] = resumen["Portafolio"].map(PORT_LABEL).fillna(resumen["Portafolio"])
+    st.dataframe(
+        resumen.style.format({"Premio total acumulado": "${:,.2f}"}),
+        use_container_width=True, hide_index=True,
+    )
 
 
 # ---- MENSUAL ----------------------------------------------------------------
 with tab_mensual:
-    st.subheader("Valor del Portafolio (cierre de mes)")
-    fig = px.line(
-        val_port, x="fecha", y="valor_mercado_neto", color="subcuenta",
-        markers=True, title="Valor de Mercado Neto",
-    )
-    fig.update_layout(yaxis_tickformat=",.0f")
-    st.plotly_chart(fig, use_container_width=True)
+    ports_in_val = [p for p in PORTFOLIOS if p in val_port["subcuenta"].unique()]
 
-    st.subheader("Rendimiento mensual (MoM)")
-    fig2 = px.bar(
-        val_port.dropna(subset=["mom_pct"]),
-        x="fecha", y="mom_pct", color="subcuenta",
-        barmode="group", title="% MoM (basado en Valor de Mercado Neto)",
+    # ---- Valor del Portafolio cierre de mes (3 paneles, escala independiente) ----
+    st.subheader("Valor del Portafolio en cada cierre de mes")
+    st.caption(
+        "Saldo oficial al ultimo dia de cada mes (de la hoja Posicion). "
+        "Las anotaciones muestran el valor en cada punto."
     )
-    fig2.update_layout(yaxis_tickformat=".2%")
-    st.plotly_chart(fig2, use_container_width=True)
+    fig_v = make_subplots(
+        rows=len(ports_in_val), cols=1, shared_xaxes=True,
+        subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_val],
+        vertical_spacing=0.07,
+    )
+    for i, p in enumerate(ports_in_val, 1):
+        sub_v = val_port[val_port["subcuenta"] == p].sort_values("fecha")
+        color = PORT_COLORS.get(p, "#374151")
+        # Linea
+        fig_v.add_trace(go.Scatter(
+            x=sub_v["fecha"], y=sub_v["valor_mercado_neto"],
+            mode="lines+markers",
+            line=dict(color=color, width=2.5),
+            marker=dict(size=8, color=color, line=dict(color="white", width=1.5)),
+            showlegend=False,
+            hovertemplate="<b>%{x|%b %Y}</b><br>$%{y:,.0f}<extra></extra>",
+        ), row=i, col=1)
+        fig_v.update_yaxes(tickprefix="$", tickformat=",.2s",
+                            gridcolor=GRID, zerolinecolor=GRID, row=i, col=1)
+        fig_v.update_xaxes(gridcolor=GRID, row=i, col=1, dtick="M1")
+    fig_v.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=200 * len(ports_in_val) + 80,
+        title=dict(text="<b>Valor de Mercado Neto - cierres mensuales</b>",
+                    x=0.01, xanchor="left"),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_v, use_container_width=True)
 
-    st.subheader("Plus/Minus + Intereses Devengados (cierre de mes)")
+    # ---- Rendimiento mensual MoM ----
+    st.subheader("Rendimiento mensual (MoM %)")
+    st.caption(
+        "Cambio porcentual mes contra mes basado en Valor de Mercado Neto. "
+        "Verde = ganancia, rojo = perdida."
+    )
+    mom_data = val_port.dropna(subset=["mom_pct"]).copy()
+    fig_mom = make_subplots(
+        rows=len(ports_in_val), cols=1, shared_xaxes=True,
+        subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_val],
+        vertical_spacing=0.08,
+    )
+    for i, p in enumerate(ports_in_val, 1):
+        d = mom_data[mom_data["subcuenta"] == p].sort_values("fecha")
+        colors = [GREEN if v >= 0 else RED for v in d["mom_pct"]]
+        fig_mom.add_trace(go.Bar(
+            x=d["fecha"], y=d["mom_pct"],
+            marker=dict(color=colors, line=dict(width=0)),
+            text=[f"{v*100:+.1f}%" for v in d["mom_pct"]],
+            textposition="outside",
+            textfont=dict(size=10),
+            showlegend=False,
+            hovertemplate="<b>%{x|%b %Y}</b><br>%{y:.2%}<extra></extra>",
+        ), row=i, col=1)
+        fig_mom.add_hline(y=0, line=dict(color="#9ca3af", width=1), row=i, col=1)
+        fig_mom.update_yaxes(tickformat=".1%", gridcolor=GRID,
+                              zerolinecolor="#9ca3af", row=i, col=1)
+        fig_mom.update_xaxes(gridcolor=GRID, row=i, col=1, dtick="M1")
+    fig_mom.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=200 * len(ports_in_val) + 80,
+        title=dict(text="<b>Rendimiento mes contra mes</b>", x=0.01, xanchor="left"),
+        bargap=0.2,
+    )
+    st.plotly_chart(fig_mom, use_container_width=True)
+
+    # ---- Plus/Minus en cierres de mes ----
+    st.subheader("Plusvalia / Minusvalia + Intereses Devengados")
+    st.caption(
+        "Suma de la columna `Plus/Minus + Int. Dev.` en la hoja Posicion. "
+        "Es la utilidad/perdida no realizada acumulada al cierre del mes."
+    )
     pm = (
         pos_f.groupby(["fecha", "subcuenta"], as_index=False)["plus_minus_int"]
         .sum()
     )
-    fig3 = px.bar(
-        pm, x="fecha", y="plus_minus_int", color="subcuenta",
-        barmode="group", title="Plusvalia / Minusvalia + Intereses (MXN)",
+    fig_pm = make_subplots(
+        rows=len(ports_in_val), cols=1, shared_xaxes=True,
+        subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_val],
+        vertical_spacing=0.08,
     )
-    fig3.update_layout(yaxis_tickformat=",.0f")
-    st.plotly_chart(fig3, use_container_width=True)
+    for i, p in enumerate(ports_in_val, 1):
+        d = pm[pm["subcuenta"] == p].sort_values("fecha")
+        colors = [GREEN if v >= 0 else RED for v in d["plus_minus_int"]]
+        fig_pm.add_trace(go.Bar(
+            x=d["fecha"], y=d["plus_minus_int"],
+            marker=dict(color=colors, line=dict(width=0)),
+            showlegend=False,
+            hovertemplate="<b>%{x|%b %Y}</b><br>$%{y:,.0f}<extra></extra>",
+        ), row=i, col=1)
+        fig_pm.add_hline(y=0, line=dict(color="#9ca3af", width=1), row=i, col=1)
+        fig_pm.update_yaxes(tickprefix="$", tickformat=",.2s",
+                             gridcolor=GRID, zerolinecolor="#9ca3af", row=i, col=1)
+        fig_pm.update_xaxes(gridcolor=GRID, row=i, col=1, dtick="M1")
+    fig_pm.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=200 * len(ports_in_val) + 80,
+        title=dict(text="<b>Plus/Minus + Intereses devengados</b>",
+                    x=0.01, xanchor="left"),
+        bargap=0.2,
+    )
+    st.plotly_chart(fig_pm, use_container_width=True)
 
 
 # ---- COMPOSICION ------------------------------------------------------------
 with tab_compos:
-    st.subheader("Composicion por Estrategia (ultimo mes)")
     last_date = pos_f["fecha"].max()
     last_pos = pos_f[pos_f["fecha"] == last_date]
+    ports_in_pos = [p for p in PORTFOLIOS if p in last_pos["subcuenta"].unique()]
+
+    # ---- Composicion por Estrategia ----
+    st.subheader(f"Composicion por estrategia al {last_date:%d %b %Y}")
+    st.caption(
+        "Treemap: el area de cada caja es proporcional al peso. "
+        "Una caja por estrategia dentro de cada portafolio. Los porcentajes son "
+        "respecto al total del portafolio."
+    )
     by_strat = (
         last_pos.groupby(["subcuenta", "estrategia"], as_index=False)["valor_mercado_neto"].sum()
     )
-    fig = px.sunburst(
-        by_strat, path=["subcuenta", "estrategia"],
+    by_strat["pct"] = by_strat.groupby("subcuenta")["valor_mercado_neto"].transform(
+        lambda x: x / x.sum()
+    )
+    by_strat["label"] = by_strat["estrategia"]
+    by_strat["valor_lbl"] = by_strat["valor_mercado_neto"].apply(fmt_money)
+
+    fig_tree = px.treemap(
+        by_strat,
+        path=[px.Constant("Total"), "subcuenta", "estrategia"],
         values="valor_mercado_neto",
-        title=f"Distribucion al {last_date:%Y-%m-%d}",
+        color="subcuenta",
+        color_discrete_map={p: PORT_COLORS.get(p, "#374151") for p in PORTFOLIOS},
+        custom_data=["pct", "valor_lbl"],
     )
-    st.plotly_chart(fig, use_container_width=True)
+    fig_tree.update_traces(
+        texttemplate="<b>%{label}</b><br>%{customdata[1]}<br>%{percentParent:.1%}",
+        textfont=dict(size=12),
+        hovertemplate="<b>%{label}</b><br>"
+                       "Valor: %{customdata[1]}<br>"
+                       "% del padre: %{percentParent:.2%}<br>"
+                       "% del total: %{percentRoot:.2%}<extra></extra>",
+    )
+    fig_tree.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=500,
+        title=dict(text="<b>Distribucion por estrategia</b>", x=0.01),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    st.plotly_chart(fig_tree, use_container_width=True)
 
-    st.subheader("Top 15 emisoras por Valor de Mercado (ultimo mes)")
+    # ---- Top emisoras por portafolio ----
+    st.subheader(f"Top 10 emisoras por portafolio")
+    st.caption(
+        "Las 10 posiciones mas grandes por valor de mercado en cada portafolio. "
+        "Una etiqueta arriba de cada barra muestra el peso en cartera."
+    )
     top = (
-        last_pos.groupby(["subcuenta", "emisora"], as_index=False)["valor_mercado_neto"].sum()
-        .sort_values("valor_mercado_neto", ascending=False)
+        last_pos.groupby(["subcuenta", "emisora", "serie"], as_index=False)
+        ["valor_mercado_neto"].sum()
     )
-    fig2 = px.bar(
-        top.groupby("subcuenta").head(15),
-        x="valor_mercado_neto", y="emisora", color="subcuenta",
-        orientation="h", facet_col="subcuenta", facet_col_wrap=3,
-        height=600,
-    )
-    fig2.update_layout(yaxis_tickformat=",.0f", showlegend=False)
-    fig2.update_yaxes(matches=None)
-    st.plotly_chart(fig2, use_container_width=True)
+    top["instrumento"] = top["emisora"].astype(str) + " " + top["serie"].astype(str)
 
-    st.subheader("Plus/Minus % por emisora (ultimo mes)")
-    pm = last_pos.copy()
-    pm = pm.dropna(subset=["plus_minus_pct"])
-    fig3 = px.scatter(
-        pm, x="valor_mercado_neto", y="plus_minus_pct",
-        color="estrategia", facet_col="subcuenta", facet_col_wrap=3,
-        hover_data=["emisora", "serie", "titulos"],
-        title="Tamano de posicion vs rendimiento",
+    fig_top = make_subplots(
+        rows=1, cols=len(ports_in_pos),
+        subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_pos],
+        horizontal_spacing=0.12,
     )
-    fig3.update_yaxes(tickformat=".1%", matches=None)
-    fig3.update_xaxes(matches=None)
-    st.plotly_chart(fig3, use_container_width=True)
+    for j, p in enumerate(ports_in_pos, 1):
+        d = top[top["subcuenta"] == p].sort_values(
+            "valor_mercado_neto", ascending=True
+        ).tail(10)
+        if d.empty:
+            continue
+        total_p = top[top["subcuenta"] == p]["valor_mercado_neto"].sum()
+        d["pct"] = d["valor_mercado_neto"] / total_p
+        color = PORT_COLORS.get(p, "#374151")
+        fig_top.add_trace(go.Bar(
+            x=d["valor_mercado_neto"], y=d["instrumento"],
+            orientation="h",
+            marker=dict(color=color, line=dict(width=0)),
+            text=[f"{v*100:.1f}%" for v in d["pct"]],
+            textposition="outside",
+            textfont=dict(size=10),
+            showlegend=False,
+            hovertemplate="<b>%{y}</b><br>$%{x:,.0f}<br>"
+                           "Peso: %{text}<extra></extra>",
+        ), row=1, col=j)
+        fig_top.update_xaxes(tickprefix="$", tickformat=",.2s",
+                              gridcolor=GRID, row=1, col=j)
+        fig_top.update_yaxes(gridcolor=GRID, row=1, col=j)
+    fig_top.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=520,
+        title=dict(text=f"<b>Top emisoras al {last_date:%b %Y}</b>", x=0.01),
+        bargap=0.25,
+    )
+    st.plotly_chart(fig_top, use_container_width=True)
+
+    # ---- Scatter: tamaño vs rendimiento ----
+    st.subheader("Tamano de posicion vs rendimiento (Plus/Minus %)")
+    st.caption(
+        "Cada punto es una emisora. Eje X = valor de mercado (escala log), "
+        "Eje Y = rendimiento %. Las posiciones mas grandes a la derecha; "
+        "las que estan ganando arriba del 0% (verde), las perdiendo abajo (rojo). "
+        "Color por estrategia."
+    )
+    pm_data = last_pos.copy()
+    pm_data = pm_data.dropna(subset=["plus_minus_pct"])
+    pm_data = pm_data[pm_data["valor_mercado_neto"] > 0]
+
+    fig_sc = make_subplots(
+        rows=1, cols=len(ports_in_pos),
+        subplot_titles=[PORT_LABEL.get(p, p) for p in ports_in_pos],
+        horizontal_spacing=0.08,
+    )
+    estrategia_colors = {
+        "BÁSICO": "#2563eb",
+        "INCOME": "#7c3aed",
+        "GUBER EE.UU.": "#0891b2",
+        "INDEFINIDO": "#64748b",
+        "MX": "#d97706",
+        "US": "#0d9488",
+        "SIN ESTRATEGIA": "#9ca3af",
+    }
+    for j, p in enumerate(ports_in_pos, 1):
+        d = pm_data[pm_data["subcuenta"] == p]
+        if d.empty:
+            continue
+        for est, sub_e in d.groupby("estrategia"):
+            color = estrategia_colors.get(est, "#374151")
+            fig_sc.add_trace(go.Scatter(
+                x=sub_e["valor_mercado_neto"], y=sub_e["plus_minus_pct"],
+                mode="markers",
+                marker=dict(size=10, color=color, opacity=0.75,
+                             line=dict(color="white", width=1)),
+                name=est, legendgroup=est,
+                showlegend=(j == 1),
+                customdata=np.stack(
+                    [sub_e["emisora"], sub_e["serie"], sub_e["titulos"]], axis=1
+                ),
+                hovertemplate="<b>%{customdata[0]} %{customdata[1]}</b><br>"
+                               "Valor: $%{x:,.0f}<br>"
+                               "Plus/Minus: %{y:.2%}<br>"
+                               "Titulos: %{customdata[2]:,.0f}"
+                               "<extra></extra>",
+            ), row=1, col=j)
+        fig_sc.add_hline(y=0, line=dict(color="#9ca3af", width=1, dash="dash"),
+                          row=1, col=j)
+        fig_sc.update_xaxes(type="log", tickprefix="$", tickformat=",.2s",
+                             gridcolor=GRID, row=1, col=j)
+        fig_sc.update_yaxes(tickformat=".0%", gridcolor=GRID,
+                             zerolinecolor="#9ca3af", row=1, col=j)
+    fig_sc.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=460,
+        title=dict(text=f"<b>Tamano vs rendimiento al {last_date:%b %Y}</b>", x=0.01),
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig_sc, use_container_width=True)
 
 
 # ---- OPERACIONES ------------------------------------------------------------
 with tab_oper:
-    st.subheader("Numero de operaciones por dia y portafolio")
-    op_daily = (
-        mov_f.dropna(subset=["fecha_op"])
-        .groupby(["subcuenta", "fecha_op"], as_index=False)
-        .size()
-        .rename(columns={"size": "n_ops"})
-    )
-    fig = px.bar(
-        op_daily, x="fecha_op", y="n_ops", color="subcuenta",
-        barmode="group", title="# de operaciones",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    ports_in_oper = [p for p in PORTFOLIOS if p in mov_f["subcuenta"].unique()]
 
-    st.subheader("Mix por concepto")
+    # ---- # operaciones agrupadas mensualmente ----
+    st.subheader("Numero de operaciones por mes")
+    st.caption(
+        "Cuantas operaciones (de cualquier tipo) se ejecutaron cada mes en "
+        "cada portafolio. Util para identificar meses de mayor actividad."
+    )
+    mov_f_mes = mov_f.dropna(subset=["fecha_op"]).copy()
+    mov_f_mes["mes"] = mov_f_mes["fecha_op"].dt.to_period("M").dt.to_timestamp()
+    op_monthly = (
+        mov_f_mes.groupby(["subcuenta", "mes"], as_index=False)
+        .size().rename(columns={"size": "n_ops"})
+    )
+
+    fig_op = go.Figure()
+    for p in ports_in_oper:
+        d = op_monthly[op_monthly["subcuenta"] == p].sort_values("mes")
+        color = PORT_COLORS.get(p, "#374151")
+        fig_op.add_trace(go.Bar(
+            x=d["mes"], y=d["n_ops"],
+            name=PORT_LABEL.get(p, p),
+            marker=dict(color=color, line=dict(width=0)),
+            hovertemplate=f"<b>{PORT_LABEL.get(p, p)}</b><br>%{{x|%b %Y}}<br>"
+                           f"%{{y:,.0f}} operaciones<extra></extra>",
+        ))
+    fig_op.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=400,
+        title=dict(text="<b>Operaciones por mes</b>", x=0.01),
+        barmode="group",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        bargap=0.2,
+    )
+    fig_op.update_xaxes(gridcolor=GRID, dtick="M1")
+    fig_op.update_yaxes(gridcolor=GRID, zerolinecolor=GRID, tickformat=",.0f")
+    st.plotly_chart(fig_op, use_container_width=True)
+
+    # ---- Mix por concepto ----
+    st.subheader("Volumen operado por tipo de concepto")
+    st.caption(
+        "Suma de montos netos por concepto de operacion. Los reportos dominan "
+        "el volumen porque rotan diariamente. Las compras/ventas de capital y "
+        "dividendos dan el detalle del movimiento real del portafolio."
+    )
     mix = (
-        mov_f.groupby(["subcuenta", "concepto"], as_index=False)["monto_neto"].sum()
+        mov_f.groupby(["subcuenta", "concepto"], as_index=False)["monto_neto"]
+        .agg(["sum", "count"])
+        .reset_index()
     )
-    fig2 = px.bar(
-        mix, x="subcuenta", y="monto_neto", color="concepto",
-        title="Volumen acumulado en MXN",
+    mix.columns = ["subcuenta", "concepto", "monto_neto", "n_ops"]
+    mix["monto_abs"] = mix["monto_neto"].abs()
+    # Top 10 conceptos en valor
+    top_conc = (
+        mix.groupby("concepto")["monto_abs"].sum().nlargest(10).index.tolist()
     )
-    fig2.update_layout(yaxis_tickformat=",.0f")
-    st.plotly_chart(fig2, use_container_width=True)
+    mix_f = mix[mix["concepto"].isin(top_conc)].copy()
+    mix_f["subcuenta_lbl"] = mix_f["subcuenta"].map(PORT_LABEL).fillna(mix_f["subcuenta"])
 
-    st.subheader("Tasas de reporto contratadas")
-    rep = mov_f[mov_f["concepto"] == "INICIO CPA REPORTO"].dropna(subset=["tasa_premio"]).copy()
+    fig_mix = px.bar(
+        mix_f, x="concepto", y="monto_abs", color="subcuenta",
+        color_discrete_map={p: PORT_COLORS.get(p, "#374151") for p in PORTFOLIOS},
+        barmode="group", custom_data=["n_ops", "subcuenta_lbl"],
+    )
+    fig_mix.update_traces(
+        hovertemplate="<b>%{customdata[1]}</b><br>%{x}<br>"
+                       "Monto: $%{y:,.0f}<br>"
+                       "# ops: %{customdata[0]:,.0f}<extra></extra>",
+    )
+    fig_mix.update_layout(
+        **PLOTLY_BASE_LAYOUT,
+        height=480,
+        title=dict(text="<b>Volumen acumulado por concepto (MXN)</b>", x=0.01),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title=""),
+        xaxis=dict(tickangle=-30),
+        bargap=0.25,
+    )
+    fig_mix.update_yaxes(tickprefix="$", tickformat=",.2s",
+                          gridcolor=GRID, zerolinecolor=GRID)
+    fig_mix.update_xaxes(gridcolor=GRID)
+    st.plotly_chart(fig_mix, use_container_width=True)
+
+    # ---- Tasas de reporto promedio ponderadas ----
+    st.subheader("Tasa de reporto contratada en el tiempo")
+    st.caption(
+        "Tasa anual % a la que se contrato cada repo. Linea = promedio "
+        "ponderado por monto, mes a mes. Refleja el nivel de tasas de fondeo "
+        "(TIIE/CETES) que esta capturando el portafolio."
+    )
+    rep = mov_f[mov_f["concepto"] == "INICIO CPA REPORTO"].dropna(
+        subset=["tasa_premio", "fecha_op"]
+    ).copy()
     rep["monto_abs"] = rep["monto_neto"].abs()
     rep = rep[rep["monto_abs"] > 0]
     if not rep.empty:
-        fig3 = px.scatter(
-            rep, x="fecha_op", y="tasa_premio", color="subcuenta",
-            size="monto_abs", hover_data=["emisora", "plazo", "monto_neto"],
-            title="Tasa contratada vs fecha (tamano = |monto|)",
+        # Promedio ponderado mensual
+        rep["mes"] = rep["fecha_op"].dt.to_period("M").dt.to_timestamp()
+        wavg = (
+            rep.groupby(["subcuenta", "mes"])
+            .apply(lambda g: (g["tasa_premio"] * g["monto_abs"]).sum() / g["monto_abs"].sum())
+            .reset_index(name="tasa_wavg")
         )
-        st.plotly_chart(fig3, use_container_width=True)
+
+        fig_tas = go.Figure()
+        # Scatter de fondo (cada repo individual)
+        for p in ports_in_oper:
+            d = rep[rep["subcuenta"] == p]
+            color = PORT_COLORS.get(p, "#374151")
+            fig_tas.add_trace(go.Scatter(
+                x=d["fecha_op"], y=d["tasa_premio"],
+                mode="markers",
+                marker=dict(size=5, color=color, opacity=0.25,
+                             line=dict(width=0)),
+                name=f"{PORT_LABEL.get(p, p)} (operaciones)",
+                showlegend=False,
+                hovertemplate=f"<b>{PORT_LABEL.get(p, p)}</b><br>%{{x|%d %b %Y}}<br>"
+                               f"Tasa: %{{y:.2f}}%<extra></extra>",
+            ))
+        # Lineas de promedio ponderado
+        for p in ports_in_oper:
+            d = wavg[wavg["subcuenta"] == p].sort_values("mes")
+            color = PORT_COLORS.get(p, "#374151")
+            fig_tas.add_trace(go.Scatter(
+                x=d["mes"], y=d["tasa_wavg"],
+                mode="lines+markers",
+                line=dict(color=color, width=2.5),
+                marker=dict(size=8, color=color, line=dict(color="white", width=1.5)),
+                name=PORT_LABEL.get(p, p),
+                hovertemplate=f"<b>{PORT_LABEL.get(p, p)} - promedio ponderado</b><br>"
+                               f"%{{x|%b %Y}}<br>"
+                               f"Tasa: %{{y:.2f}}%<extra></extra>",
+            ))
+        fig_tas.update_layout(
+            **PLOTLY_BASE_LAYOUT,
+            height=460,
+            title=dict(
+                text="<b>Tasas de reporto - operaciones individuales y promedio ponderado mensual</b>",
+                x=0.01,
+            ),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        fig_tas.update_yaxes(ticksuffix="%", gridcolor=GRID, zerolinecolor=GRID)
+        fig_tas.update_xaxes(gridcolor=GRID)
+        st.plotly_chart(fig_tas, use_container_width=True)
+    else:
+        st.info("No hay operaciones de reporto en el rango seleccionado.")
 
 
 # ---- DATOS CRUDOS -----------------------------------------------------------
