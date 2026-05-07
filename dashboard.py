@@ -320,7 +320,7 @@ SC_USD_FALLBACK: dict[str, str] = {
     "SHV.MX": "SHV",
     "SHY.MX": "SHY",
     "SPG.MX": "SPG",
-    "SPHY.MX": "SPHY",
+    # SPHY: usar precio directo de SPHY.MX (BMV/SIC), sin conversion USD x FX
     "T.MX": "T",
     "UNH.MX": "UNH",
     "UPS.MX": "UPS",
