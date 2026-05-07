@@ -314,17 +314,12 @@ def get_ticker(emisora: str, serie: str | None) -> str | None:
 # Para los SC cross-listed (US ETFs/acciones en SIC), el .MX puede tener
 # baja liquidez y huecos. Mapeamos al ticker USD original; luego multiplicamos
 # por el USDMXN para tener un precio en MXN sin huecos.
-SC_USD_FALLBACK: dict[str, str] = {
-    "HYG.MX": "HYG",
-    "PFE.MX": "PFE",
-    "SHV.MX": "SHV",
-    "SHY.MX": "SHY",
-    "SPG.MX": "SPG",
-    # SPHY: usar precio directo de SPHY.MX (BMV/SIC), sin conversion USD x FX
-    "T.MX": "T",
-    "UNH.MX": "UNH",
-    "UPS.MX": "UPS",
-}
+# Politica del usuario: TODAS las acciones americanas cross-listed en BMV/SIC
+# se valuan con su precio de cierre directo en .MX (cotizacion en pesos en
+# Mexico). No se calculan sinteticamente como USD x USDMXN. En dias sin trade
+# en SIC, el reindex().ffill() en compute_daily_mtm lleva el ultimo precio
+# conocido al siguiente dia disponible.
+SC_USD_FALLBACK: dict[str, str] = {}
 FX_TICKER = "MXN=X"  # USDMXN spot en yfinance
 
 
@@ -2364,12 +2359,11 @@ with tab_data:
     st.divider()
     st.subheader("Historico de precios de cierre diarios (yfinance)")
     st.caption(
-        "Cierre ajustado en MXN para cada ticker .MX en el rango seleccionado. "
-        "Una columna por ticker. Para los SC cross-listed (HYG, SPHY, SHV, "
-        "etc.) la fuente PRIMARIA es el ticker USD original x USDMXN (NYSE = "
-        "liquidez real, sin outliers de SIC). En holidays donde NYSE estuvo "
-        "cerrado se aplica forward-fill desde el ultimo cierre conocido para "
-        "garantizar precio en todos los dias habiles MX."
+        "Cierre directo en MXN de cada ticker .MX (cotizacion en BMV/SIC). "
+        "Las acciones americanas cross-listed (HYG, SHV, SPHY, etc.) se "
+        "valuan SIEMPRE con su precio de cierre en SIC, no con calculos "
+        "sinteticos USD x USDMXN. En dias sin trade se aplica forward-fill "
+        "desde el ultimo cierre conocido."
     )
 
     tickers_to_dl = sorted({t for t in cat["ticker_yfinance"].dropna().unique() if t})
