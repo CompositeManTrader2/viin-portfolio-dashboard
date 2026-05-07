@@ -265,11 +265,19 @@ FX_TICKER = "MXN=X"  # USDMXN spot en yfinance
 
 
 def _fetch_close(ticker: str, start: str, end: str) -> pd.Series | None:
-    """Descarga el cierre ajustado diario de un ticker; tolera errores."""
+    """Descarga el cierre diario sin ajustar de un ticker; tolera errores.
+
+    IMPORTANTE: Usamos `auto_adjust=False` y la columna `Close` (precio
+    no ajustado por dividendos/splits). Para MTM historico necesitamos el
+    precio que REALMENTE cotizo ese dia, no el ajustado retroactivamente.
+    Si usaramos `Adj Close`, los precios historicos estarian deflactados
+    por dividendos posteriores, subestimando el valor del portafolio en
+    fechas pasadas.
+    """
     try:
         data = yf.download(
             ticker, start=start, end=end, progress=False,
-            auto_adjust=True, threads=False,
+            auto_adjust=False, threads=False,
         )
         if data is None or data.empty:
             return None
@@ -516,6 +524,146 @@ def interpolate_importe_neto(
     return pd.DataFrame(out)
 
 
+def compute_repo_values_daily(
+    mov: pd.DataFrame, dates: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """Valuacion exacta de reportos abiertos cada dia.
+
+    Para cada `INICIO CPA REPORTO` busca su `VEN.COMPRA REPORTO` matching por
+    folio. Mientras el repo esta vivo (start <= dia < end), su valor es:
+        monto x (1 + tasa/360 x dias_transcurridos)
+    donde monto = monto_neto del INICIO y tasa = tasa_premio/100 (tasa anual).
+
+    Si un mismo (subcuenta, emisora, serie) tiene varios repos abiertos
+    simultaneamente, sus valores se suman.
+
+    Devuelve long DataFrame: (fecha, subcuenta, emisora, serie, tp, valor_repo).
+    """
+    if mov.empty:
+        return pd.DataFrame(
+            columns=["fecha", "subcuenta", "emisora", "serie", "tp", "valor_repo"]
+        )
+
+    inicios = mov[mov["concepto"] == "INICIO CPA REPORTO"].copy()
+    if inicios.empty:
+        return pd.DataFrame(
+            columns=["fecha", "subcuenta", "emisora", "serie", "tp", "valor_repo"]
+        )
+    # Mismo folio puede aparecer en archivos contiguos: dedup
+    inicios = inicios.drop_duplicates(subset=["folio", "subcuenta"])
+
+    vens = mov[mov["concepto"] == "VEN.COMPRA REPORTO"].copy()
+    vens = vens.drop_duplicates(subset=["folio", "subcuenta"])
+    vens_idx = vens.set_index(["folio", "subcuenta"])["fecha_liq"].to_dict()
+
+    rows = []
+    dates_idx = pd.DatetimeIndex(dates)
+
+    for _, r in inicios.iterrows():
+        if pd.isna(r["fecha_liq"]):
+            continue
+        start_date = pd.Timestamp(r["fecha_liq"])
+
+        # Fecha de cierre del repo
+        ven_key = (r["folio"], r["subcuenta"])
+        if ven_key in vens_idx and pd.notna(vens_idx[ven_key]):
+            end_date = pd.Timestamp(vens_idx[ven_key])
+        elif pd.notna(r["plazo"]):
+            end_date = start_date + pd.Timedelta(days=int(r["plazo"]))
+        else:
+            continue
+
+        monto = float(r["monto_neto"]) if pd.notna(r["monto_neto"]) else 0.0
+        if monto <= 0:
+            continue
+
+        # tasa_premio en INICIO es la tasa anual %
+        rate = float(r["tasa_premio"]) / 100 if pd.notna(r["tasa_premio"]) else 0.0
+        port = r["subcuenta"]
+        emi = r["emisora"]
+        serie = (
+            str(r["serie"]).strip()
+            if pd.notna(r["serie"]) and str(r["serie"]).strip() != "nan"
+            else "*"
+        )
+
+        # Iterar dias [start, end)
+        in_range = dates_idx[(dates_idx >= start_date) & (dates_idx < end_date)]
+        for d in in_range:
+            days_elapsed = (d - start_date).days
+            value = monto * (1 + rate / 360 * days_elapsed)
+            rows.append({
+                "fecha": d,
+                "subcuenta": port,
+                "emisora": emi,
+                "serie": serie,
+                "tp": "R",
+                "valor_repo": value,
+            })
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["fecha", "subcuenta", "emisora", "serie", "tp", "valor_repo"]
+        )
+
+    df = pd.DataFrame(rows)
+    df = df.groupby(
+        ["fecha", "subcuenta", "emisora", "serie", "tp"], as_index=False
+    )["valor_repo"].sum()
+    return df
+
+
+def carry_values_daily(
+    pos: pd.DataFrame, mov: pd.DataFrame, dates: pd.DatetimeIndex
+) -> pd.DataFrame:
+    """Combina carry interpolado con valuacion exacta de reportos.
+
+    Para TP=R: usa el valor exacto computado por `compute_repo_values_daily`.
+    Para el resto: interpolacion lineal del importe_neto entre snapshots.
+    Se hace outer-merge para capturar repos intra-mes que pudieran no estar
+    en ningun snapshot (raro, pero posible).
+    """
+    base = interpolate_importe_neto(pos, dates)
+    repos_exact = compute_repo_values_daily(mov, dates)
+    if repos_exact.empty:
+        return base
+    if base.empty:
+        # Solo repos
+        repos_exact = repos_exact.rename(columns={"valor_repo": "importe_neto"})
+        return repos_exact[
+            ["fecha", "subcuenta", "emisora", "serie", "tp", "importe_neto"]
+        ]
+
+    base = base.copy()
+    base["serie_n"] = base["serie"].astype(str).str.strip()
+    repos_exact = repos_exact.copy()
+    repos_exact["serie_n"] = repos_exact["serie"].astype(str).str.strip()
+
+    # Outer merge para capturar repos intra-mes ausentes en snapshots
+    merged = base.merge(
+        repos_exact[["fecha", "subcuenta", "emisora", "serie_n", "tp", "valor_repo"]],
+        on=["fecha", "subcuenta", "emisora", "serie_n", "tp"],
+        how="outer",
+        indicator=True,
+    )
+
+    # Para TP=R con valor exacto disponible: reemplazar
+    is_repo_exact = (merged["tp"] == "R") & merged["valor_repo"].notna()
+    merged["importe_neto"] = np.where(
+        is_repo_exact,
+        merged["valor_repo"],
+        merged["importe_neto"],
+    )
+
+    # Si la fila viene solo de repos_exact, llenar serie desde serie_n
+    only_repo = merged["_merge"] == "right_only"
+    merged.loc[only_repo, "serie"] = merged.loc[only_repo, "serie_n"]
+
+    merged = merged.drop(columns=["serie_n", "valor_repo", "_merge"])
+    merged = merged.dropna(subset=["importe_neto"])
+    return merged
+
+
 def daily_cash(mov: pd.DataFrame, dates: pd.DatetimeIndex) -> pd.DataFrame:
     """Saldo de efectivo de cierre por fecha de LIQUIDACION (no operacion).
 
@@ -598,8 +746,10 @@ def compute_daily_mtm(
     # Para los que tienen ticker valido y precio, valor_mercado = titulos * precio
     h["valor_equity"] = h["titulos"] * h["precio"]
 
-    # Para los que no tienen ticker (renta fija) o precio faltante, usamos importe_neto interpolado
-    carry = interpolate_importe_neto(pos, dates)
+    # Para los que no tienen ticker:
+    # - TP=R (reporto): valor EXACTO = monto x (1 + tasa/360 x dias_corridos)
+    # - TP=D (bono) y otros: importe_neto interpolado entre snapshots
+    carry = carry_values_daily(pos, mov, dates)
     h = h.merge(
         carry,
         on=["fecha", "subcuenta", "emisora", "serie", "tp"],
