@@ -1342,15 +1342,7 @@ def compute_daily_mtm(
     )
     by_port = by_port.merge(official, on=["fecha", "subcuenta"], how="left")
 
-    # CALIBRACION: usamos solo los SNAPSHOTS oficiales de Posicion como anclas
-    # (12/año). El modelo construye los valores diarios con su metodologia
-    # (yfinance + reportos exactos + bonos exactos + cash) y se ancla a la
-    # Posicion oficial al cierre de cada mes.
-    #
-    # Los valores diarios del archivo de cobro se cargan SOLO como referencia
-    # visual para comparar contra el calculo del modelo — no se usan como
-    # anclas. Asi el modelo refleja su propia valuacion y el usuario puede
-    # ver la diferencia vs back-office en pantalla.
+    # Cargar cobro diario (referencia y ancla del TOTAL consolidado)
     cobro_diario = load_cobro_diario()
     if not cobro_diario.empty:
         by_port = by_port.merge(
@@ -1359,8 +1351,61 @@ def compute_daily_mtm(
     else:
         by_port["valor_diario"] = np.nan
 
-    # Ancla solo en cierres de mes (valor_oficial del snapshot)
-    by_port["residual_anchor"] = by_port["valor_oficial"] - by_port["valor_total_raw"]
+    # ----------------------------------------------------------------------
+    # CALIBRACION A NIVEL TOTAL CONSOLIDADO
+    # ----------------------------------------------------------------------
+    # El TOTAL CONSOLIDADO (suma de los 3 portafolios) se ancla diariamente
+    # al cobro del back-office (cuando esta disponible). La DISTRIBUCION
+    # entre portafolios y entre activos viene del MODELO (precios yfinance,
+    # devengo de reportos, etc.) — solo se ajusta proporcionalmente.
+    #
+    # Algoritmo:
+    #   1. Sumar valor_total_raw de los 3 portafolios por dia.
+    #   2. Definir ancla_total del dia:
+    #        preferir cobro_total (suma diaria del cobro)
+    #        fallback: suma de snapshots oficiales (en cierres de mes)
+    #   3. residual_total = ancla_total - raw_total
+    #   4. Distribuir residual_total entre los portafolios proporcional al
+    #      peso de cada uno en el raw (preserva la mezcla del modelo).
+    # ----------------------------------------------------------------------
+    raw_total_day = (
+        by_port.groupby("fecha", as_index=False)["valor_total_raw"]
+        .sum()
+        .rename(columns={"valor_total_raw": "raw_total_day"})
+    )
+    cobro_total_day = (
+        by_port.dropna(subset=["valor_diario"])
+        .groupby("fecha", as_index=False)["valor_diario"]
+        .sum()
+        .rename(columns={"valor_diario": "cobro_total_day"})
+    )
+    cobro_total_day = cobro_total_day[cobro_total_day["cobro_total_day"] > 0]
+
+    official_total_day = (
+        by_port.dropna(subset=["valor_oficial"])
+        .groupby("fecha", as_index=False)["valor_oficial"]
+        .sum()
+        .rename(columns={"valor_oficial": "oficial_total_day"})
+    )
+
+    ancla = raw_total_day.merge(cobro_total_day, on="fecha", how="left").merge(
+        official_total_day, on="fecha", how="left"
+    )
+    ancla["ancla_total"] = ancla["cobro_total_day"].fillna(ancla["oficial_total_day"])
+    ancla["residual_total"] = ancla["ancla_total"] - ancla["raw_total_day"]
+
+    by_port = by_port.merge(
+        ancla[["fecha", "raw_total_day", "residual_total"]],
+        on="fecha", how="left",
+    )
+    # Peso proporcional del portafolio en el raw (mezcla del modelo)
+    by_port["port_weight"] = np.where(
+        by_port["raw_total_day"].abs() > 1e-9,
+        by_port["valor_total_raw"] / by_port["raw_total_day"],
+        0.0,
+    )
+    by_port["residual_anchor"] = by_port["residual_total"] * by_port["port_weight"]
+    by_port = by_port.drop(columns=["raw_total_day", "residual_total", "port_weight"])
 
     # Interpolacion temporal del residual por subcuenta (vectorizado).
     by_port = by_port.sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
