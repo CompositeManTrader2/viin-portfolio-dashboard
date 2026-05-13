@@ -189,9 +189,60 @@ def load_movimientos(files: list[str]) -> pd.DataFrame:
     return out
 
 
+def _parse_posicion_sheet(
+    xl: pd.ExcelFile, sheet_name: str, file_date: datetime,
+    cols: list[str], use_header_fecha: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Parsea una hoja de Posicion (actual o 'del mes anterior') y devuelve
+    (posiciones, totales). Si use_header_fecha=True, lee la fecha del header
+    de la hoja (celda L4 / col 11) en lugar de usar file_date — necesario
+    para 'Posicion del mes anterior'."""
+    raw = pd.read_excel(xl, sheet_name=sheet_name, header=None, engine="openpyxl")
+
+    actual_date = file_date
+    if use_header_fecha:
+        try:
+            hdr_date = raw.iloc[3, 11]  # fila 4, col 12 (Fecha:)
+            if pd.notna(hdr_date):
+                actual_date = pd.to_datetime(hdr_date).to_pydatetime()
+        except Exception:
+            pass
+
+    body = _fit_columns(raw.iloc[8:].copy(), cols)
+    body["emisora"] = body["emisora"].astype(str).str.strip()
+    body["subcuenta"] = body["subcuenta"].astype(str).str.strip()
+
+    for c in ["titulos", "precio", "importe_bruto", "precio_neto",
+              "importe_neto", "precio_mercado", "valor_mercado_neto",
+              "plus_minus_int", "plus_minus_pct", "pct_cartera",
+              "cupon", "plazo", "tasa", "dias_x_ven"]:
+        body[c] = pd.to_numeric(body[c], errors="coerce")
+
+    is_total = body["emisora"].apply(_norm).isin(TOTAL_LABELS) & (
+        (body["subcuenta"] == "") | (body["subcuenta"].isna()) |
+        (body["subcuenta"].str.lower() == "nan")
+    )
+    tot = body[is_total].copy()
+    tot["fecha"] = actual_date
+
+    pos = body[~is_total].copy()
+    pos = pos.dropna(subset=["subcuenta"])
+    pos = pos[pos["subcuenta"].isin(PORTFOLIOS)]
+    pos["fecha"] = actual_date
+    pos["estrategia"] = pos["estrategia"].fillna("SIN ESTRATEGIA").astype(str).str.strip()
+
+    return pos, tot[["fecha", "emisora", "valor_mercado_neto"]]
+
+
 @st.cache_data(show_spinner=False)
 def load_posiciones(files: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Devuelve (posiciones, totales)."""
+    """Devuelve (posiciones, totales).
+
+    Carga la hoja 'Posicion' de cada archivo. ADICIONALMENTE, del PRIMER
+    archivo (cronologicamente), tambien carga la hoja 'Posicion del mes
+    anterior' que contiene el snapshot al cierre del mes previo (anchor
+    inicial para reconstruccion diaria del periodo).
+    """
     cols = [
         "tp", "subcuenta", "emisora", "serie", "cupon", "plazo", "tasa",
         "dias_x_ven", "titulos", "precio", "importe_bruto", "precio_neto",
@@ -199,42 +250,35 @@ def load_posiciones(files: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
         "plus_minus_int", "plus_minus_pct", "pct_cartera", "estrategia",
     ]
     pos_dfs, tot_dfs = [], []
-    for f in files:
+    files_sorted = sorted(files, key=lambda f: _file_date(Path(f)) or datetime.min)
+
+    for idx, f in enumerate(files_sorted):
         path = Path(f)
         file_date = _file_date(path)
         xl = pd.ExcelFile(path, engine="openpyxl")
+
+        # Hoja Posicion (actual)
         sn = _find_sheet(xl, "Posicion")
-        if not sn:
-            continue
-        raw = pd.read_excel(xl, sheet_name=sn, header=None, engine="openpyxl")
-        body = _fit_columns(raw.iloc[8:].copy(), cols)
-        body["emisora"] = body["emisora"].astype(str).str.strip()
-        body["subcuenta"] = body["subcuenta"].astype(str).str.strip()
+        if sn:
+            pos, tot = _parse_posicion_sheet(xl, sn, file_date, cols, use_header_fecha=False)
+            pos_dfs.append(pos)
+            tot_dfs.append(tot)
 
-        # Numeric coercion
-        for c in ["titulos", "precio", "importe_bruto", "precio_neto",
-                  "importe_neto", "precio_mercado", "valor_mercado_neto",
-                  "plus_minus_int", "plus_minus_pct", "pct_cartera",
-                  "cupon", "plazo", "tasa", "dias_x_ven"]:
-            body[c] = pd.to_numeric(body[c], errors="coerce")
-
-        # Totales: filas con subcuenta vacia y emisora en TOTAL_LABELS
-        is_total = body["emisora"].apply(_norm).isin(TOTAL_LABELS) & (
-            (body["subcuenta"] == "") | (body["subcuenta"].isna()) |
-            (body["subcuenta"].str.lower() == "nan")
-        )
-        # 'Valor del Portafolio' aparece a nivel cliente (sin subcuenta) y consolidado;
-        # tomamos su valor del campo valor_mercado_neto
-        tot = body[is_total].copy()
-        tot["fecha"] = file_date
-        tot_dfs.append(tot[["fecha", "emisora", "valor_mercado_neto"]])
-
-        pos = body[~is_total].copy()
-        pos = pos.dropna(subset=["subcuenta"])
-        pos = pos[pos["subcuenta"].isin(PORTFOLIOS)]
-        pos["fecha"] = file_date
-        pos["estrategia"] = pos["estrategia"].fillna("SIN ESTRATEGIA").astype(str).str.strip()
-        pos_dfs.append(pos)
+        # SOLO del primer archivo: cargar tambien "Posicion del mes anterior"
+        # para tener el anchor previo y poder reconstruir el periodo desde el dia 1.
+        if idx == 0:
+            sn_prev = None
+            for s in xl.sheet_names:
+                if "anterior" in _norm(s):
+                    sn_prev = s
+                    break
+            if sn_prev:
+                pos_prev, tot_prev = _parse_posicion_sheet(
+                    xl, sn_prev, file_date, cols, use_header_fecha=True
+                )
+                if not pos_prev.empty:
+                    pos_dfs.append(pos_prev)
+                    tot_dfs.append(tot_prev)
 
     if not pos_dfs:
         return pd.DataFrame(), pd.DataFrame()
