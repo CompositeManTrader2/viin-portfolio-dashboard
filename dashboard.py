@@ -724,6 +724,30 @@ def interpolate_importe_neto(
     return pd.DataFrame(out)
 
 
+def _normalize_repo_series(df: pd.DataFrame) -> pd.DataFrame:
+    """Colapsa las distintas series de un repo (BPAG91 280907, 280511, 290913)
+    bajo '*' porque son la misma posicion de money market, solo con plazo
+    distinto. Sin esta normalizacion, el merge holdings x carry falla porque
+    el snapshot trae una serie y los movimientos intra-mes traen otras.
+
+    Aplica a:
+      - pos: filas con tp == 'R'
+      - mov: filas con concepto IN ('INICIO CPA REPORTO', 'VEN.COMPRA REPORTO')
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    if "tp" in df.columns:
+        mask = df["tp"] == "R"
+        if mask.any():
+            df.loc[mask, "serie"] = "*"
+    if "concepto" in df.columns:
+        mask = df["concepto"].isin(["INICIO CPA REPORTO", "VEN.COMPRA REPORTO"])
+        if mask.any():
+            df.loc[mask, "serie"] = "*"
+    return df
+
+
 def compute_repo_values_daily(
     mov: pd.DataFrame, dates: pd.DatetimeIndex
 ) -> pd.DataFrame:
@@ -1070,6 +1094,31 @@ def compute_daily_mtm(
     holdings_with_prices: long, util para depurar.
     missing_tickers: instrumentos que se valuaron al carry porque yfinance no devolvio data.
     """
+    # Normalizar series de reporto: BPAG91 280907/280511/290913/etc -> "*"
+    # son todas la misma posicion de money market.
+    pos = _normalize_repo_series(pos)
+    mov = _normalize_repo_series(mov)
+    # Para pos, si despues de normalizar quedaron filas duplicadas (mismo
+    # (fecha, port, emi, "*", tp=R)), agregamos sumando los valores.
+    repo_mask = pos["tp"] == "R"
+    if repo_mask.any():
+        repos_pos = pos[repo_mask].copy()
+        non_repos = pos[~repo_mask]
+        # Agregar todas las columnas numericas
+        num_cols = repos_pos.select_dtypes(include="number").columns.tolist()
+        non_num = [
+            c for c in repos_pos.columns
+            if c not in num_cols and c not in [
+                "fecha", "subcuenta", "emisora", "serie", "tp"
+            ]
+        ]
+        agg = {c: "sum" for c in num_cols}
+        agg.update({c: "first" for c in non_num})
+        repos_pos = repos_pos.groupby(
+            ["fecha", "subcuenta", "emisora", "serie", "tp"], as_index=False
+        ).agg(agg)
+        pos = pd.concat([non_repos, repos_pos], ignore_index=True)
+
     bdays = pd.bdate_range(start=start, end=end)
     # Incluir tambien las fechas de snapshot (cierre de mes que cae en sabado/domingo)
     snap_dates = pd.DatetimeIndex(
