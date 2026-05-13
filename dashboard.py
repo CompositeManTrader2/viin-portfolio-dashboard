@@ -10,6 +10,7 @@ Ejecucion:
 
 from __future__ import annotations
 
+import io
 import re
 import unicodedata
 from pathlib import Path
@@ -1204,6 +1205,69 @@ def compute_daily_mtm(
     return by_port, h, missing
 
 
+def build_historico_excel(daily_mtm: pd.DataFrame) -> bytes:
+    """Genera un Excel con el historico diario del valor del portafolio.
+
+    Hojas:
+      1. 'Resumen consolidado' - una columna por portafolio + Total
+      2. 'Rendimiento'         - retorno acumulado % por portafolio
+      3. Una hoja por portafolio (VIIN_XXX1, VIIN_XXX3, VIIN_XXX6) con
+         el desglose diario: equity, carry, efectivo, raw, ajuste,
+         total, oficial.
+    """
+    buf = io.BytesIO()
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        # ---- Sheet 1: Resumen consolidado (valor total por portafolio + Total) ----
+        resumen = (
+            daily_mtm.pivot_table(
+                index="fecha", columns="subcuenta", values="valor_total"
+            )
+            .sort_index()
+        )
+        resumen.columns = [PORT_LABEL.get(c, c) for c in resumen.columns]
+        resumen["Total Cliente"] = resumen.sum(axis=1)
+        resumen.index = resumen.index.strftime("%Y-%m-%d")
+        resumen.index.name = "Fecha"
+        resumen.to_excel(writer, sheet_name="Resumen consolidado", float_format="%.2f")
+
+        # ---- Sheet 2: Rendimiento acumulado % ----
+        rend = resumen.copy()
+        for c in rend.columns:
+            first = rend[c].iloc[0]
+            if first and not pd.isna(first):
+                rend[c] = rend[c] / first - 1
+        rend.to_excel(writer, sheet_name="Rendimiento acumulado %",
+                       float_format="%.6f")
+
+        # ---- Sheets por portafolio ----
+        for port in sorted(daily_mtm["subcuenta"].unique()):
+            sub = (
+                daily_mtm[daily_mtm["subcuenta"] == port]
+                .sort_values("fecha")
+                .copy()
+            )
+            sub_out = sub[[
+                "fecha", "valor_equity", "valor_carry", "efectivo",
+                "valor_total_raw", "ajuste_calibracion", "valor_total",
+                "valor_oficial",
+            ]].copy()
+            sub_out["fecha"] = pd.to_datetime(sub_out["fecha"]).dt.strftime("%Y-%m-%d")
+            sub_out.columns = [
+                "Fecha", "Equity (MTM)", "Renta fija / Reporto",
+                "Efectivo", "Suma raw", "Ajuste calibracion",
+                "Valor total", "Valor oficial (snapshots)",
+            ]
+            # Hoja con el sufijo del portafolio (ultimos 4 chars)
+            sheet_name = f"VIIN_{port[-4:]}"
+            sub_out.to_excel(
+                writer, sheet_name=sheet_name, index=False, float_format="%.2f"
+            )
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def reconstruct_position(
     portfolio: str,
     target_date: pd.Timestamp,
@@ -1991,13 +2055,40 @@ with tab_carta:
                 )
                 c4.metric("Efectivo", f"${totals['efectivo']:,.2f}")
 
-                # Descarga
+                # Descargas
+                dl_c1, dl_c2 = st.columns(2)
+                with dl_c1:
+                    st.download_button(
+                        f"Carta {port_carta} - {target_ts:%Y%m%d} (CSV)",
+                        df_carta.to_csv(index=False).encode("utf-8"),
+                        f"carta_posicion_{port_carta}_{target_ts:%Y%m%d}.csv",
+                        "text/csv",
+                        key=f"dl_carta_{port_carta}_{target_ts:%Y%m%d}",
+                    )
+
+                # ---- Export historico valor del portafolio (Excel) ----
+                st.divider()
+                st.subheader("Exportar historico del valor del portafolio")
+                st.caption(
+                    "Genera un archivo Excel con el historico diario del "
+                    "valor del portafolio para todo el periodo. Hojas: "
+                    "Resumen consolidado (una columna por portafolio + total), "
+                    "Rendimiento acumulado %, y una hoja por portafolio con "
+                    "el desglose diario (equity, renta fija, efectivo, total)."
+                )
+
+                excel_bytes = build_historico_excel(daily_mtm)
+                rng_label = (
+                    f"{pd.Timestamp(daily_mtm['fecha'].min()):%Y%m%d}_"
+                    f"{pd.Timestamp(daily_mtm['fecha'].max()):%Y%m%d}"
+                )
                 st.download_button(
-                    f"Descargar carta {port_carta} {target_ts:%Y%m%d} (CSV)",
-                    df_carta.to_csv(index=False).encode("utf-8"),
-                    f"carta_posicion_{port_carta}_{target_ts:%Y%m%d}.csv",
-                    "text/csv",
-                    key=f"dl_carta_{port_carta}_{target_ts:%Y%m%d}",
+                    "Descargar historico del portafolio (Excel)",
+                    excel_bytes,
+                    f"historico_valor_portafolio_{rng_label}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_hist_excel_{target_ts:%Y%m%d}",
+                    type="primary",
                 )
 
 
