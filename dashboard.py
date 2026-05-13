@@ -1386,6 +1386,31 @@ def compute_daily_mtm(
     ]
     by_port = by_port[cols_order].sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
 
+    # Expandir a calendario diario completo (incluye fines de semana / festivos)
+    # y forward-fill los valores del portafolio. El mercado no se mueve en dias
+    # no habiles, asi que el valor de un sabado/domingo = valor del viernes.
+    # Las columnas de ancla (valor_oficial, valor_diario) NO se ffillean porque
+    # solo deben aparecer en sus dias exactos (snapshots, cobro).
+    full_dates = pd.date_range(start=start, end=end, freq="D")
+    ffill_cols = [
+        "valor_equity", "valor_carry", "efectivo",
+        "valor_total_raw", "ajuste_calibracion", "valor_total",
+    ]
+    pieces_full = []
+    for port, sub in by_port.groupby("subcuenta", sort=False):
+        sub_idx = sub.set_index("fecha").sort_index()
+        sub_full = sub_idx.reindex(full_dates)
+        sub_full.index.name = "fecha"
+        for c in ffill_cols:
+            if c in sub_full.columns:
+                sub_full[c] = sub_full[c].ffill()
+        sub_full["subcuenta"] = port
+        pieces_full.append(sub_full.reset_index())
+    by_port = pd.concat(pieces_full, ignore_index=True)[cols_order]
+    by_port = by_port.dropna(subset=["valor_total"]).sort_values(
+        ["subcuenta", "fecha"]
+    ).reset_index(drop=True)
+
     return by_port, h, missing
 
 
