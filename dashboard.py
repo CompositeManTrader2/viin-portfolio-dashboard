@@ -1342,21 +1342,25 @@ def compute_daily_mtm(
     )
     by_port = by_port.merge(official, on=["fecha", "subcuenta"], how="left")
 
-    # Anclas diarias del archivo de cobro (back-office). Si existe, calibra
-    # contra ESTOS valores diarios (1 ancla por dia, mas granular). Si no,
-    # cae a los snapshots mensuales de Posicion (12 anclas por año).
+    # CALIBRACION: usamos solo los SNAPSHOTS oficiales de Posicion como anclas
+    # (12/año). El modelo construye los valores diarios con su metodologia
+    # (yfinance + reportos exactos + bonos exactos + cash) y se ancla a la
+    # Posicion oficial al cierre de cada mes.
+    #
+    # Los valores diarios del archivo de cobro se cargan SOLO como referencia
+    # visual para comparar contra el calculo del modelo — no se usan como
+    # anclas. Asi el modelo refleja su propia valuacion y el usuario puede
+    # ver la diferencia vs back-office en pantalla.
     cobro_diario = load_cobro_diario()
     if not cobro_diario.empty:
         by_port = by_port.merge(
             cobro_diario, on=["fecha", "subcuenta"], how="left"
         )
-        # Ancla preferida: cobro diario. Fallback: valor_oficial del snapshot.
-        by_port["ancla"] = by_port["valor_diario"].fillna(by_port["valor_oficial"])
     else:
         by_port["valor_diario"] = np.nan
-        by_port["ancla"] = by_port["valor_oficial"]
 
-    by_port["residual_anchor"] = by_port["ancla"] - by_port["valor_total_raw"]
+    # Ancla solo en cierres de mes (valor_oficial del snapshot)
+    by_port["residual_anchor"] = by_port["valor_oficial"] - by_port["valor_total_raw"]
 
     # Interpolacion temporal del residual por subcuenta (vectorizado).
     by_port = by_port.sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
@@ -1714,12 +1718,18 @@ with tab_mtm:
         ports_in_data = [p for p in PORTFOLIOS if p in daily_mtm["subcuenta"].unique()]
 
         # ---- Total consolidado: suma de los portafolios seleccionados ----
+        # Si la columna valor_diario (cobro) existe, agregamos a totales
+        agg_cols = {
+            "valor_total": ("valor_total", "sum"),
+            "valor_equity": ("valor_equity", "sum"),
+            "valor_carry": ("valor_carry", "sum"),
+            "efectivo": ("efectivo", "sum"),
+            "valor_oficial": ("valor_oficial", "sum"),
+        }
+        if "valor_diario" in daily_mtm.columns:
+            agg_cols["valor_cobro"] = ("valor_diario", "sum")
         total_per_day = daily_mtm.groupby("fecha", as_index=False).agg(
-            valor_total=("valor_total", "sum"),
-            valor_equity=("valor_equity", "sum"),
-            valor_carry=("valor_carry", "sum"),
-            efectivo=("efectivo", "sum"),
-            valor_oficial=("valor_oficial", "sum"),
+            **agg_cols
         ).sort_values("fecha")
 
         # KPIs consolidados
@@ -1788,6 +1798,22 @@ with tab_mtm:
             hovertemplate="<b>Cierre %{x|%b %Y}</b><br>"
                           "Total: $%{y:,.0f}<extra></extra>",
         ))
+
+        # Linea de referencia: total diario del cobro (back-office) si esta
+        # disponible. NO se usa como ancla del modelo, solo como contraste
+        # visual para ver donde difiere nuestra valuacion vs la del cliente.
+        if "valor_cobro" in total_per_day.columns:
+            cobro_ref = total_per_day.dropna(subset=["valor_cobro"])
+            cobro_ref = cobro_ref[cobro_ref["valor_cobro"] > 0]
+            if not cobro_ref.empty:
+                fig_total.add_trace(go.Scatter(
+                    x=cobro_ref["fecha"], y=cobro_ref["valor_cobro"],
+                    mode="lines",
+                    line=dict(color="#dc2626", width=1.5, dash="dot"),
+                    name="Cobro (back-office)",
+                    hovertemplate="<b>%{x|%d %b %Y}</b><br>"
+                                  "Cobro: $%{y:,.0f}<extra></extra>",
+                ))
         fig_total.update_layout(
             **PLOTLY_BASE_LAYOUT,
             height=480,
