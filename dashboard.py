@@ -234,6 +234,67 @@ def _parse_posicion_sheet(
     return pos, tot[["fecha", "emisora", "valor_mercado_neto"]]
 
 
+COBRO_DIR = Path(__file__).parent / "Cobro"
+
+
+@st.cache_data(show_spinner=False)
+def load_cobro_diario() -> pd.DataFrame:
+    """Carga los valores diarios oficiales del cobro de comisiones (back-office).
+
+    El archivo `Cobro/cobro_diario_*.xlsx` tiene una hoja por mes (ENE25, FEB25...)
+    con valores diarios consolidados por portafolio que el cliente ve. Estos
+    valores son la mejor referencia para la calibracion diaria porque incluyen
+    devengos y ajustes que el snapshot mensual de Posicion a veces no recoge.
+
+    Estructura por hoja:
+      - Filas 8 en adelante con: contrato (col A), fecha (col B), monto total
+        (col C), VIIN1 (col J), VIIN3 (col K), VIIN6 (col L).
+
+    Devuelve DataFrame long: (fecha, subcuenta, valor_diario)
+    """
+    if not COBRO_DIR.exists():
+        return pd.DataFrame()
+    rows = []
+    for path in sorted(COBRO_DIR.glob("*.xlsx")):
+        try:
+            xl = pd.ExcelFile(path, engine="openpyxl")
+        except Exception:
+            continue
+        for sn in xl.sheet_names:
+            # Solo hojas de meses (3 letras + 2 digitos): ENE25, FEB25, etc.
+            if not (len(sn) >= 5 and sn[-2:].isdigit()):
+                continue
+            try:
+                raw = pd.read_excel(xl, sheet_name=sn, header=None, engine="openpyxl")
+            except Exception:
+                continue
+            # Datos diarios: fila 8 en adelante, columnas B (fecha), J, K, L
+            for i in range(7, min(50, raw.shape[0])):
+                fecha_val = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+                v_total = raw.iloc[i, 2] if raw.shape[1] > 2 else None
+                v1 = raw.iloc[i, 9] if raw.shape[1] > 9 else None
+                v3 = raw.iloc[i, 10] if raw.shape[1] > 10 else None
+                v6 = raw.iloc[i, 11] if raw.shape[1] > 11 else None
+                if not isinstance(fecha_val, (pd.Timestamp, datetime)):
+                    continue
+                fecha_ts = pd.Timestamp(fecha_val)
+                if pd.notna(v1):
+                    rows.append({"fecha": fecha_ts, "subcuenta": "VIIN000000000001",
+                                  "valor_diario": float(v1)})
+                if pd.notna(v3):
+                    rows.append({"fecha": fecha_ts, "subcuenta": "VIIN000000000003",
+                                  "valor_diario": float(v3)})
+                if pd.notna(v6):
+                    rows.append({"fecha": fecha_ts, "subcuenta": "VIIN000000000006",
+                                  "valor_diario": float(v6)})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates(
+        subset=["fecha", "subcuenta"], keep="last"
+    ).sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def load_posiciones(files: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Devuelve (posiciones, totales).
@@ -1268,8 +1329,22 @@ def compute_daily_mtm(
         .rename(columns={"valor_mercado_neto": "valor_oficial"})
     )
     by_port = by_port.merge(official, on=["fecha", "subcuenta"], how="left")
-    # residual_anchor: solo en dias de snapshot (NaN en el resto)
-    by_port["residual_anchor"] = by_port["valor_oficial"] - by_port["valor_total_raw"]
+
+    # Anclas diarias del archivo de cobro (back-office). Si existe, calibra
+    # contra ESTOS valores diarios (1 ancla por dia, mas granular). Si no,
+    # cae a los snapshots mensuales de Posicion (12 anclas por año).
+    cobro_diario = load_cobro_diario()
+    if not cobro_diario.empty:
+        by_port = by_port.merge(
+            cobro_diario, on=["fecha", "subcuenta"], how="left"
+        )
+        # Ancla preferida: cobro diario. Fallback: valor_oficial del snapshot.
+        by_port["ancla"] = by_port["valor_diario"].fillna(by_port["valor_oficial"])
+    else:
+        by_port["valor_diario"] = np.nan
+        by_port["ancla"] = by_port["valor_oficial"]
+
+    by_port["residual_anchor"] = by_port["ancla"] - by_port["valor_total_raw"]
 
     # Interpolacion temporal del residual por subcuenta (vectorizado).
     by_port = by_port.sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
@@ -1291,7 +1366,7 @@ def compute_daily_mtm(
         "fecha", "subcuenta",
         "valor_equity", "valor_carry", "efectivo",
         "valor_total_raw", "ajuste_calibracion", "valor_total",
-        "valor_oficial",
+        "valor_oficial", "valor_diario",
     ]
     by_port = by_port[cols_order].sort_values(["subcuenta", "fecha"]).reset_index(drop=True)
 
