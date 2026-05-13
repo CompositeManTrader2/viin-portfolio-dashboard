@@ -278,6 +278,18 @@ def load_cobro_diario() -> pd.DataFrame:
                 if not isinstance(fecha_val, (pd.Timestamp, datetime)):
                     continue
                 fecha_ts = pd.Timestamp(fecha_val)
+
+                # Validar coherencia: la suma de los 3 portafolios debe matchear
+                # con el total. Si no, el cobro tiene un error de captura (caso
+                # observado en DIC25 donde J=K=L=total y la suma es 3 veces el
+                # total). En ese caso descartamos la fila y dejamos que la
+                # calibracion caiga al snapshot oficial de Posicion.
+                vals = [v for v in (v1, v3, v6) if pd.notna(v)]
+                if v_total is not None and pd.notna(v_total) and vals:
+                    suma_ind = sum(vals)
+                    ratio = suma_ind / float(v_total) if float(v_total) != 0 else 0
+                    if not (0.98 <= ratio <= 1.02):
+                        continue  # datos rotos, ignorar este dia
                 if pd.notna(v1):
                     rows.append({"fecha": fecha_ts, "subcuenta": "VIIN000000000001",
                                   "valor_diario": float(v1)})
